@@ -1,0 +1,6 @@
+numpy>=1.26
+soundcard>=0.4.3
+scipy>=1.13
+matplotlib>=3.8
+pywin32>=306
+interception-python>=0.4

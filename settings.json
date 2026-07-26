@@ -1,0 +1,12 @@
+{
+  "device": "Speaker (Realtek(R) Audio)",
+  "input_manager": "Human Interface Device",
+  "automation": "Default",
+  "autostart": true,
+  "threshold": -35.0,
+  "cooldown": 2.0,
+  "mod_ctrl": false,
+  "mod_alt": false,
+  "mod_shift": false,
+  "main_key": "P"
+}
