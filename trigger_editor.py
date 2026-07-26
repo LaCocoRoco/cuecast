@@ -67,10 +67,11 @@ AUTOMATION_WOW_FIRST_DELAY_RANGE = (0.0, 1.0)
 AUTOMATION_WOW_FIXED_DELAY = 0.5
 AUTOMATION_WOW_SECOND_DELAY_RANGE = (0.0, 1.0)
 
-# Ein Wurf dauert in WoW maximal ~22s. Wurde 20s lang kein Biss (Trigger) erkannt, brechen wir
-# den Wurf selbst ab (Taste erneut drücken) und werfen mit derselben festen Pause wie beim
-# Fangen/Auswerfen-Signal neu aus - Sicherheitsnetz gegen "hängengebliebene" Würfe.
-AUTOMATION_WOW_TIMEOUT_SECONDS = 20.0
+# Ein Wurf dauert in WoW maximal ~22s. Wird lange kein Biss (Trigger) erkannt, drücken wir
+# die Taste einmal (siehe _check_wow_timeout) - Sicherheitsnetz gegen "hängengebliebene"
+# Würfe. Der genaue Wert ist über "Timeout (s)" in der Oberfläche einstellbar, das hier ist
+# nur der Default.
+AUTOMATION_WOW_TIMEOUT_DEFAULT = 30.0
 AUTOMATION_WOW_TIMEOUT_CHECK_MS = 1000
 
 
@@ -136,13 +137,13 @@ class TriggerEditor(tk.Tk):
         self.record_button.grid(row=0, column=2, sticky="w", padx=4, pady=2)
 
         # VB-CABLE (virtuelles Audiogerät für Rechner ohne echte Soundkarte): nur Status +
-        # Öffnen des mitgelieferten, unveränderten Installers - kein automatischer Download
-        # oder Silent-Install, siehe vbcable_driver.py (Lizenzgrund).
+        # Link zur offiziellen Download-Seite, damit der Treiber immer aktuell bleibt
+        # (siehe vbcable_driver.py) - kein gebündelter/lokal installierter Installer.
         ttk.Label(controls, text="VB-CABLE:").grid(row=0, column=3, sticky="w", padx=(16, 4), pady=2)
         self.vbcable_status_var = tk.StringVar(value="?")
         ttk.Label(controls, textvariable=self.vbcable_status_var).grid(row=0, column=4, sticky="w", padx=4, pady=2)
         self.vbcable_button = ttk.Button(
-            controls, text="Installer", width=BUTTON_WIDTH, command=self._open_vbcable_installer
+            controls, text="Download", width=BUTTON_WIDTH, command=self._open_vbcable_download_page
         )
         self.vbcable_button.grid(row=0, column=5, sticky="w", padx=4, pady=2)
 
@@ -274,6 +275,17 @@ class TriggerEditor(tk.Tk):
         )
         self.main_key_combo.pack(side="left", padx=4)
         self.main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
+
+        # Sicherheitsnetz nur für die World-of-Warcraft-Automation (siehe _check_wow_timeout) -
+        # wird live gelesen, kein Neustart der Erkennung nötig.
+        ttk.Label(automation_frame, text="Timeout (s):").pack(side="left", padx=(16, 0))
+        self.wow_timeout_var = tk.DoubleVar(value=AUTOMATION_WOW_TIMEOUT_DEFAULT)
+        wow_timeout_spinbox = ttk.Spinbox(
+            automation_frame, from_=10.0, to=60.0, increment=5.0, textvariable=self.wow_timeout_var, width=6
+        )
+        wow_timeout_spinbox.pack(side="left", padx=4)
+        for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+            wow_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
         # Live-Erkennung: Threshold/Cooldown/Start + Log
         monitor_frame = ttk.Frame(self, height=ROW_HEIGHT)
@@ -604,6 +616,8 @@ class TriggerEditor(tk.Tk):
         main_key = settings.get("main_key")
         if main_key in keys.MAIN_KEYS:
             self.main_key_var.set(main_key)
+        if "wow_timeout" in settings:
+            self.wow_timeout_var.set(float(settings["wow_timeout"]))
 
     def _save_settings(self):
         save_settings({
@@ -617,6 +631,7 @@ class TriggerEditor(tk.Tk):
             "mod_alt": self.mod_alt_var.get(),
             "mod_shift": self.mod_shift_var.get(),
             "main_key": self.main_key_var.get(),
+            "wow_timeout": self.wow_timeout_var.get(),
         })
 
     # --- Text Input Manager ---
@@ -688,24 +703,9 @@ class TriggerEditor(tk.Tk):
         installed = vbcable_driver.is_installed()
         self.vbcable_status_var.set("Installed" if installed else "Not installed")
 
-    def _open_vbcable_installer(self):
-        self._log("Opening VB-CABLE installer (Windows admin prompt may appear)...")
-        self.vbcable_button.config(state="disabled")
-
-        def worker():
-            try:
-                vbcable_driver.open_installer()
-                message = "VB-CABLE installer closed."
-            except Exception as exc:
-                message = f"VB-CABLE installer failed: {exc}"
-            self.after(0, self._on_vbcable_installer_done, message)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_vbcable_installer_done(self, message):
-        self._log(message)
-        self.vbcable_button.config(state="normal")
-        self._refresh_vbcable_status()
+    def _open_vbcable_download_page(self):
+        vbcable_driver.open_download_page()
+        self._log("Opened VB-CABLE download page in browser.")
 
     # --- Live-Erkennung ---
     def _toggle_monitoring(self):
@@ -714,6 +714,10 @@ class TriggerEditor(tk.Tk):
             self.monitor = None
             self.monitor_button.config(text="Start")
             self._log("Stopped.")
+            # Uhr zuruecksetzen, damit ein spaeterer Start nicht sofort (mit einem laengst
+            # veralteten Zeitstempel) einen Timeout ausloest, bevor ueberhaupt ein neuer Biss
+            # erkannt wurde.
+            self.last_cast_at = None
             return
 
         index = self.device_combo.current()
@@ -726,7 +730,9 @@ class TriggerEditor(tk.Tk):
         self.monitor_button.config(text="Stop")
         self._log(f"Started (threshold={threshold:.1f} dB, cooldown={cooldown:.1f}s).")
 
-        self.last_cast_at = time.perf_counter()
+        # last_cast_at bleibt bewusst None, bis der erste echte Biss erkannt und die
+        # WoW-Automation einmal durchgelaufen ist (siehe _run_wow_automation) - das
+        # Timeout-Sicherheitsnetz greift erst danach, nicht schon direkt nach Start.
         self._check_wow_timeout()
 
     def _on_monitor_settings_changed(self):
@@ -776,22 +782,23 @@ class TriggerEditor(tk.Tk):
         # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
         if self.monitor is None:
             return
+        timeout = float(self.wow_timeout_var.get())
         if (
             self.automation_var.get() == AUTOMATION_WOW
             and self.last_cast_at is not None
-            and time.perf_counter() - self.last_cast_at >= AUTOMATION_WOW_TIMEOUT_SECONDS
+            and time.perf_counter() - self.last_cast_at >= timeout
         ):
-            self._log(f"No bite within {AUTOMATION_WOW_TIMEOUT_SECONDS:.0f}s - interrupting and recasting.")
-            # Uhr sofort zurücksetzen, damit der Timeout nicht mehrfach hintereinander feuert,
-            # während die Interrupt+Recast-Sequenz im Hintergrund-Thread noch läuft.
+            # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
+            # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus). Ein
+            # zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort wieder
+            # abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt dauerhaft
+            # nichts ausgeworfen und der Timeout feuert immer wieder ergebnislos. Mit nur
+            # einem Druck pro Timeout pendelt sich der Zustand über die nächsten Zyklen von
+            # selbst ein.
+            self._log(f"No bite within {timeout:.0f}s - pressing signal once.")
             self.last_cast_at = time.perf_counter()
-            threading.Thread(target=self._run_wow_timeout_recast, daemon=True).start()
+            self._send_default_signal()
         self.after(AUTOMATION_WOW_TIMEOUT_CHECK_MS, self._check_wow_timeout)
-
-    def _run_wow_timeout_recast(self):
-        self.after(0, self._send_default_signal)  # Wurf unterbrechen
-        time.sleep(AUTOMATION_WOW_FIXED_DELAY)
-        self.after(0, self._send_default_signal)  # erneut auswerfen
 
     def _send_default_signal(self):
         key = self.main_key_var.get()

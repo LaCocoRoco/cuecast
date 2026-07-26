@@ -8,10 +8,10 @@ __pycache__/
 # Temporäre Datei für die Play/Pause-Vorschau im Trigger Editor
 _preview.wav
 
-# Entpackter VB-CABLE-Installer - wird bei Bedarf frisch aus dem mitgelieferten
-# VBCABLE_Driver_Pack45.zip entpackt (siehe vbcable_driver.py), muss nicht versioniert werden.
-vendor/vbcable/extracted/
-
 # Eigene Audio-Aufnahmen (echte Spiel-Sounds) - bei einem oeffentlichen Repo bewusst nicht
 # mit hochgeladen (Copyright). Beim Wechsel auf einen anderen Rechner manuell mitkopieren.
 snippets/*.wav
+
+# Persoenliche Einstellungen - je Nutzer/Rechner unterschiedlich, wird von settings.py
+# automatisch mit sinnvollen Defaults neu angelegt, falls nicht vorhanden.
+settings.json
