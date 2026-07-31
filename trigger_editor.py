@@ -96,6 +96,12 @@ COOLDOWN_DEFAULT = 2.0
 LURE_DELAY_DEFAULT = 2.0
 LURE_DELAY_RANGE_DEFAULT = 0.0
 
+# Its own pause after the Utility signal, same idea as Lure Delay - the Utility Trigger
+# works exactly like the Lure Trigger (no timer of its own, only used as part of a real
+# bite once its own delay has elapsed since last use, see _should_use_utility).
+UTILITY_DELAY_DEFAULT = 2.0
+UTILITY_DELAY_RANGE_DEFAULT = 0.0
+
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
 # fishing-trigger sequence while the one triggered by the lure is still running (see
@@ -149,6 +155,7 @@ class TriggerEditor(tk.Tk):
         # already pre-set at Start) - serves solely to avoid treating the lure's own splash
         # sound as a new bite (see _on_trigger_fired).
         self.lure_fired_at = None
+        self.utility_last_used_at = None
         self.attack_last_used_at = None
 
         # Failsafe state (see _on_trigger_fired/_check_fishing_trigger_timeout):
@@ -168,6 +175,8 @@ class TriggerEditor(tk.Tk):
         self.start_delay_range_var = tk.DoubleVar(value=START_DELAY_RANGE_DEFAULT)
         self.lure_delay_var = tk.DoubleVar(value=LURE_DELAY_DEFAULT)
         self.lure_delay_range_var = tk.DoubleVar(value=LURE_DELAY_RANGE_DEFAULT)
+        self.utility_delay_var = tk.DoubleVar(value=UTILITY_DELAY_DEFAULT)
+        self.utility_delay_range_var = tk.DoubleVar(value=UTILITY_DELAY_RANGE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
         self.failsafe_trigger_count_var = tk.DoubleVar(value=FAILSAFE_TRIGGER_COUNT_DEFAULT)
@@ -290,12 +299,12 @@ class TriggerEditor(tk.Tk):
             side="left", padx=(16, 4)
         )
 
-        # Fishing Trigger (row 0) + Lure Trigger (row 1): shared grid, so the checkbuttons/
-        # dropdowns of both rows line up exactly on top of each other (like Device/Snippets
-        # above).
+        # Fishing Trigger (row 0) + Lure Trigger (row 1) + Utility Trigger (row 2) + Attack
+        # Trigger (row 3): shared grid, so the checkbuttons/dropdowns of all rows line up
+        # exactly on top of each other (like Device/Snippets above).
         trigger_frame = ttk.Frame(self)
         trigger_frame.pack(side="top", fill="x", padx=8, pady=(0, 4))
-        for row in range(3):
+        for row in range(4):
             trigger_frame.grid_rowconfigure(row, minsize=ROW_HEIGHT)
 
         # Row 0: Fishing Trigger - signal sent when a bite (audio hit) is detected, see
@@ -356,33 +365,60 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             lure_interval_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Row 2: Attack Trigger - same layout as Fishing/Lure Trigger, just as simple as
-        # Lure Trigger: runs completely independently on the configured interval (see
+        # Row 2: Utility Trigger - works exactly like Lure Trigger (no timer of its own,
+        # only used as part of a real bite once its own delay has elapsed since last use,
+        # see _should_use_utility/_run_fishing_trigger). 0 disables it.
+        ttk.Label(trigger_frame, text="Utility Trigger:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.utility_mod_ctrl_var = tk.BooleanVar(value=False)
+        self.utility_mod_alt_var = tk.BooleanVar(value=False)
+        self.utility_mod_shift_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.utility_mod_ctrl_var, command=self._save_settings).grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.utility_mod_alt_var, command=self._save_settings).grid(row=2, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.utility_mod_shift_var, command=self._save_settings).grid(row=2, column=3, sticky="w", padx=4, pady=2)
+
+        self.utility_main_key_var = tk.StringVar(value="F9")
+        self.utility_main_key_combo = ttk.Combobox(
+            trigger_frame, textvariable=self.utility_main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
+        )
+        self.utility_main_key_combo.grid(row=2, column=4, sticky="w", padx=4, pady=2)
+        self.utility_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
+
+        ttk.Label(trigger_frame, text="Delay (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
+        self.utility_interval_var = tk.DoubleVar(value=0.0)
+        utility_interval_spinbox = ttk.Spinbox(
+            trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.utility_interval_var, width=6
+        )
+        utility_interval_spinbox.grid(row=2, column=6, sticky="w", padx=4, pady=2)
+        for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+            utility_interval_spinbox.bind(event, lambda e: self._save_settings())
+
+        # Row 3: Attack Trigger - same layout as Fishing/Lure/Utility Trigger, just as simple
+        # as Lure Trigger: runs completely independently on the configured interval (see
         # _check_attack_timer), as long as detection is active. 0 disables it.
-        ttk.Label(trigger_frame, text="Attack Trigger:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=2)
+        ttk.Label(trigger_frame, text="Attack Trigger:").grid(row=3, column=0, sticky="w", padx=(0, 4), pady=2)
         self.attack_mod_ctrl_var = tk.BooleanVar(value=False)
         self.attack_mod_alt_var = tk.BooleanVar(value=False)
         self.attack_mod_shift_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.attack_mod_ctrl_var, command=self._save_settings).grid(row=2, column=1, sticky="w", padx=4, pady=2)
-        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.attack_mod_alt_var, command=self._save_settings).grid(row=2, column=2, sticky="w", padx=4, pady=2)
-        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.attack_mod_shift_var, command=self._save_settings).grid(row=2, column=3, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.attack_mod_ctrl_var, command=self._save_settings).grid(row=3, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.attack_mod_alt_var, command=self._save_settings).grid(row=3, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.attack_mod_shift_var, command=self._save_settings).grid(row=3, column=3, sticky="w", padx=4, pady=2)
 
         self.attack_main_key_var = tk.StringVar(value="F8")
         self.attack_main_key_combo = ttk.Combobox(
             trigger_frame, textvariable=self.attack_main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
         )
-        self.attack_main_key_combo.grid(row=2, column=4, sticky="w", padx=4, pady=2)
+        self.attack_main_key_combo.grid(row=3, column=4, sticky="w", padx=4, pady=2)
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Interval (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
+        ttk.Label(trigger_frame, text="Interval (s):").grid(row=3, column=5, sticky="w", padx=(16, 4), pady=2)
         self.attack_interval_var = tk.DoubleVar(value=0.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
-        attack_interval_spinbox.grid(row=2, column=6, sticky="w", padx=4, pady=2)
+        attack_interval_spinbox.grid(row=3, column=6, sticky="w", padx=4, pady=2)
 
         attack_info_label = ttk.Label(trigger_frame, text="ⓘ", cursor="hand2")
-        attack_info_label.grid(row=2, column=7, sticky="w", padx=(8, 0), pady=2)
+        attack_info_label.grid(row=3, column=7, sticky="w", padx=(8, 0), pady=2)
         bind_tooltip(
             attack_info_label,
             "Gameplay > Combat > Enable Action Targeting\n\n"
@@ -761,6 +797,15 @@ class TriggerEditor(tk.Tk):
         if "lure_interval_seconds" in settings:
             self.lure_interval_var.set(float(settings["lure_interval_seconds"]))
 
+        self.utility_mod_ctrl_var.set(bool(settings.get("utility_mod_ctrl", False)))
+        self.utility_mod_alt_var.set(bool(settings.get("utility_mod_alt", False)))
+        self.utility_mod_shift_var.set(bool(settings.get("utility_mod_shift", False)))
+        utility_main_key = settings.get("utility_main_key")
+        if utility_main_key in keys.MAIN_KEYS:
+            self.utility_main_key_var.set(utility_main_key)
+        if "utility_interval_seconds" in settings:
+            self.utility_interval_var.set(float(settings["utility_interval_seconds"]))
+
         self.attack_mod_ctrl_var.set(bool(settings.get("attack_mod_ctrl", False)))
         self.attack_mod_alt_var.set(bool(settings.get("attack_mod_alt", False)))
         self.attack_mod_shift_var.set(bool(settings.get("attack_mod_shift", False)))
@@ -782,6 +827,10 @@ class TriggerEditor(tk.Tk):
             self.lure_delay_var.set(float(settings["lure_delay_seconds"]))
         if "lure_delay_range_seconds" in settings:
             self.lure_delay_range_var.set(float(settings["lure_delay_range_seconds"]))
+        if "utility_delay_seconds" in settings:
+            self.utility_delay_var.set(float(settings["utility_delay_seconds"]))
+        if "utility_delay_range_seconds" in settings:
+            self.utility_delay_range_var.set(float(settings["utility_delay_range_seconds"]))
         if "lure_splash_ignore_seconds" in settings:
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
@@ -831,6 +880,10 @@ class TriggerEditor(tk.Tk):
             "lure_mod_alt": self.lure_mod_alt_var.get(),
             "lure_mod_shift": self.lure_mod_shift_var.get(),
             "lure_main_key": self.lure_main_key_var.get(),
+            "utility_mod_ctrl": self.utility_mod_ctrl_var.get(),
+            "utility_mod_alt": self.utility_mod_alt_var.get(),
+            "utility_mod_shift": self.utility_mod_shift_var.get(),
+            "utility_main_key": self.utility_main_key_var.get(),
             "attack_mod_ctrl": self.attack_mod_ctrl_var.get(),
             "attack_mod_alt": self.attack_mod_alt_var.get(),
             "attack_mod_shift": self.attack_mod_shift_var.get(),
@@ -842,6 +895,7 @@ class TriggerEditor(tk.Tk):
             ("threshold", self.threshold_var),
             ("fishing_timeout_seconds", self.fishing_timeout_var),
             ("lure_interval_seconds", self.lure_interval_var),
+            ("utility_interval_seconds", self.utility_interval_var),
             ("attack_interval_seconds", self.attack_interval_var),
             ("fishing_delay_seconds", self.fishing_delay_var),
             ("fishing_delay_range_seconds", self.fishing_delay_range_var),
@@ -849,6 +903,8 @@ class TriggerEditor(tk.Tk):
             ("start_delay_range_seconds", self.start_delay_range_var),
             ("lure_delay_seconds", self.lure_delay_var),
             ("lure_delay_range_seconds", self.lure_delay_range_var),
+            ("utility_delay_seconds", self.utility_delay_var),
+            ("utility_delay_range_seconds", self.utility_delay_range_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
             ("failsafe_trigger_count", self.failsafe_trigger_count_var),
@@ -916,6 +972,7 @@ class TriggerEditor(tk.Tk):
             self.last_cast_at = None
             self.lure_last_used_at = None
             self.lure_fired_at = None
+            self.utility_last_used_at = None
             self.attack_last_used_at = None
             self.failsafe_active = False
             self.threshold_trigger_times = []
@@ -958,8 +1015,10 @@ class TriggerEditor(tk.Tk):
 
         # No more periodic timer of its own - the lure is now only used as part of a real
         # bite (see _on_trigger_fired/_run_fishing_trigger), lure_last_used_at there only
-        # serves as the reference timestamp for "has the wait time elapsed".
+        # serves as the reference timestamp for "has the wait time elapsed". Utility Trigger
+        # works exactly the same way.
         self.lure_last_used_at = time.perf_counter()
+        self.utility_last_used_at = time.perf_counter()
 
         self.attack_last_used_at = time.perf_counter()
         self._check_attack_timer()
@@ -1014,13 +1073,14 @@ class TriggerEditor(tk.Tk):
         frame = ttk.Frame(dialog)
         frame.pack(padx=12, pady=12)
 
-        # Fishing/Start/Lure Delay each get a companion "range" field (see
+        # Fishing/Start/Lure/Utility Delay each get a companion "range" field (see
         # _resolve_randomized_delay): 0 keeps the delay fixed at the base value, a nonzero
         # value randomizes it somewhere between the two fields.
         fields = (
             ("Fishing Delay (s):", self.fishing_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.fishing_delay_range_var),
             ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.start_delay_range_var),
             ("Lure Delay (s):", self.lure_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.lure_delay_range_var),
+            ("Utility Delay (s):", self.utility_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.utility_delay_range_var),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Failsafe Trigger Count:", self.failsafe_trigger_count_var, TIMING_DIALOG_COUNT_RANGE, None),
@@ -1138,8 +1198,14 @@ class TriggerEditor(tk.Tk):
         lure_delay = self._resolve_randomized_delay(
             self.lure_delay_var, LURE_DELAY_DEFAULT, self.lure_delay_range_var
         )
+        use_utility = self._should_use_utility()
+        utility_delay = self._resolve_randomized_delay(
+            self.utility_delay_var, UTILITY_DELAY_DEFAULT, self.utility_delay_range_var
+        )
         threading.Thread(
-            target=self._run_fishing_trigger, args=(use_lure, fishing_delay, lure_delay), daemon=True
+            target=self._run_fishing_trigger,
+            args=(use_lure, fishing_delay, lure_delay, use_utility, utility_delay),
+            daemon=True,
         ).start()
 
     def _should_use_lure(self):
@@ -1153,16 +1219,30 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.lure_last_used_at >= lure_interval
         )
 
-    def _run_fishing_trigger(self, use_lure, fishing_delay, lure_delay):
+    def _should_use_utility(self):
+        try:
+            utility_interval = float(self.utility_interval_var.get())
+        except (ValueError, tk.TclError):
+            return False
+        return (
+            utility_interval > 0
+            and self.utility_last_used_at is not None
+            and time.perf_counter() - self.utility_last_used_at >= utility_interval
+        )
+
+    def _run_fishing_trigger(self, use_lure, fishing_delay, lure_delay, use_utility, utility_delay):
         # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
         # sending + logging is brought back to the main thread via self.after (Tkinter is not
         # thread-safe). Sequence: catch -> Fishing Delay -> (optional) lure as its own
-        # in-between sequence with its own Lure Delay afterwards (the lure itself also takes
-        # a moment until it's actually applied) -> cast again. fishing_delay/lure_delay are
-        # resolved from the "Timing" dialog's Tk variables (base value, or a randomized value
-        # within a configured range - see _resolve_randomized_delay) on the main thread by
-        # the caller (_on_trigger_fired) and passed in here as plain values, since Tk
-        # variables must not be read from a background thread.
+        # in-between sequence with its own Lure Delay afterwards -> (optional) utility as its
+        # own in-between sequence with its own Utility Delay afterwards -> cast again. Lure
+        # and Utility never overlap - each is fully waited out (signal + its own delay)
+        # before the next step starts, even if both happen to be due in the same cycle.
+        # fishing_delay/lure_delay/utility_delay are resolved from the "Timing" dialog's Tk
+        # variables (base value, or a randomized value within a configured range - see
+        # _resolve_randomized_delay) on the main thread by the caller (_on_trigger_fired) and
+        # passed in here as plain values, since Tk variables must not be read from a
+        # background thread.
         self.after(0, self._send_fishing_signal)
         time.sleep(fishing_delay)
         if use_lure:
@@ -1173,6 +1253,10 @@ class TriggerEditor(tk.Tk):
             # before continuing with the normal sequence.
             self.after(0, self._send_lure_signal)
             time.sleep(lure_delay)
+        if use_utility:
+            # Same idea as the lure: fully sequenced, not overlapping with anything else.
+            self.after(0, self._send_utility_signal)
+            time.sleep(utility_delay)
         self.after(0, self._send_fishing_signal)
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
@@ -1271,6 +1355,14 @@ class TriggerEditor(tk.Tk):
         self._send_signal(
             self.lure_mod_ctrl_var, self.lure_mod_alt_var, self.lure_mod_shift_var, self.lure_main_key_var,
             "Lure Trigger",
+        )
+
+    def _send_utility_signal(self):
+        # Reset the clock, so the next use waits out the full delay again from now.
+        self.utility_last_used_at = time.perf_counter()
+        self._send_signal(
+            self.utility_mod_ctrl_var, self.utility_mod_alt_var, self.utility_mod_shift_var,
+            self.utility_main_key_var, "Utility Trigger",
         )
 
     def _log(self, message):
