@@ -201,17 +201,18 @@ class TriggerEditor(tk.Tk):
             props=dict(alpha=0.3, facecolor=SELECTION_COLOR),
         )
 
-        # Zeigt den lautesten Block (gleiche Blockgröße wie die Live-Erkennung, siehe
-        # matcher.compute_peak_db) der per Maus gezogenen Auswahl in dBFS - der Button
-        # übernimmt Peak minus Sicherheitspolster direkt als Threshold.
+        # Button übernimmt den lautesten Block (gleiche Blockgröße wie die Live-Erkennung,
+        # siehe matcher.compute_peak_db) der per Maus gezogenen Auswahl minus Sicherheitspolster
+        # direkt als Threshold - nur aktiv, solange etwas markiert ist (siehe
+        # _update_selection_db). Info-Text dazu rechts neben dem Button.
         selection_row = ttk.Frame(self)
         selection_row.pack(side="top", fill="x", padx=8)
-        self.selection_db_var = tk.StringVar(value="")
-        ttk.Label(selection_row, textvariable=self.selection_db_var).pack(side="left")
         self.apply_threshold_button = ttk.Button(
-            selection_row, text="Als Threshold übernehmen", command=self._apply_selection_as_threshold
+            selection_row, text="Apply as Threshold", command=self._apply_selection_as_threshold, state="disabled"
         )
-        self.apply_threshold_button.pack(side="left", padx=(8, 0))
+        self.apply_threshold_button.pack(side="left")
+        self.selection_db_var = tk.StringVar(value="")
+        ttk.Label(selection_row, textvariable=self.selection_db_var).pack(side="left", padx=(8, 0))
 
         # HID (Interception-Treiber, geht immer an das fokussierte Fenster) - Status +
         # Install/Uninstall + schneller manueller Test.
@@ -521,14 +522,17 @@ class TriggerEditor(tk.Tk):
     def _update_selection_db(self):
         if self.selection is None or self.audio is None:
             self.selection_db_var.set("")
+            self.apply_threshold_button.config(state="disabled")
             return
         start_i, end_i, start, end = self._selected_segment()
         segment = self.audio[start_i:end_i]
         if len(segment) == 0:
             self.selection_db_var.set("")
+            self.apply_threshold_button.config(state="disabled")
             return
         peak_db = compute_peak_db(segment, self.sample_rate)
         self.selection_db_var.set(f"Selection: {end - start:.2f}s, Peak {peak_db:.1f} dB")
+        self.apply_threshold_button.config(state="normal")
 
     def _apply_selection_as_threshold(self):
         if self.selection is None or self.audio is None:
@@ -867,34 +871,34 @@ class TriggerEditor(tk.Tk):
 
     def _check_angel_trigger_timeout(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Während
-        # eines laufenden Angriffs (siehe _run_attack_loop) wird hier nichts geprüft - die
-        # Angriffsschleife übernimmt, bis wieder ein echter Biss erkannt wird.
+        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Läuft
+        # unabhängig von einem laufenden Angriff (siehe _run_attack_loop) weiter - die Angel
+        # muss ja weiter (wiederholt) ausgeworfen werden, damit überhaupt wieder ein Biss
+        # erkannt werden kann, der die Angriffsschleife stoppt (siehe _on_trigger_fired).
         if self.monitor is None:
             return
-        if not self.is_attacking:
-            angel_timeout = float(self.angel_timeout_var.get())
-            if (
-                self.last_cast_at is not None
-                and time.perf_counter() - self.last_cast_at >= angel_timeout
-            ):
-                self.last_cast_at = time.perf_counter()
-                # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
-                # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus).
-                # Ein zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort
-                # wieder abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt
-                # dauerhaft nichts ausgeworfen und der Timeout feuert immer wieder
-                # ergebnislos. Mit nur einem Druck pro Timeout pendelt sich der Zustand über
-                # die nächsten Zyklen von selbst ein.
-                self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
-                self._send_angel_signal()
-                if float(self.attack_interval_var.get()) > 0:
-                    # Erst danach: vermutlich durch einen Angriff unterbrochen - wiederholt
-                    # angreifen (siehe _run_attack_loop), bis wieder ein echter Biss
-                    # (Threshold) erkannt wird (siehe _on_trigger_fired). 0 schaltet ab.
-                    self._log("Starting attack loop.")
-                    self.is_attacking = True
-                    self._run_attack_loop()
+        angel_timeout = float(self.angel_timeout_var.get())
+        if (
+            self.last_cast_at is not None
+            and time.perf_counter() - self.last_cast_at >= angel_timeout
+        ):
+            self.last_cast_at = time.perf_counter()
+            # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
+            # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus). Ein
+            # zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort wieder
+            # abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt dauerhaft
+            # nichts ausgeworfen und der Timeout feuert immer wieder ergebnislos. Mit nur
+            # einem Druck pro Timeout pendelt sich der Zustand über die nächsten Zyklen von
+            # selbst ein.
+            self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+            self._send_angel_signal()
+            if float(self.attack_interval_var.get()) > 0 and not self.is_attacking:
+                # Angriffsschleife nur beim ersten Mal starten (siehe _run_attack_loop) -
+                # läuft danach unabhängig weiter, bis wieder ein echter Biss (Threshold)
+                # erkannt wird. 0 schaltet ab.
+                self._log("Starting attack loop.")
+                self.is_attacking = True
+                self._run_attack_loop()
         self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
 
     def _run_attack_loop(self):
