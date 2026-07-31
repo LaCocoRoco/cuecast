@@ -272,8 +272,8 @@ class TriggerEditor(tk.Tk):
             angel_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
         # Zeile 1: Lure Trigger - gleicher Aufbau wie Angel Trigger, aber eigenes Signal, das
-        # automatisch nach Ablauf des Intervalls (Minuten) erneut gesendet wird, um den Köder
-        # aufzufrischen - siehe _check_lure_timer. 0 Minuten schaltet das Intervall ab.
+        # automatisch nach Ablauf des Intervalls (Sekunden) erneut gesendet wird, um den Köder
+        # aufzufrischen - siehe _check_lure_timer. 0 schaltet das Intervall ab.
         ttk.Label(trigger_frame, text="Lure Trigger:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
         self.lure_mod_ctrl_var = tk.BooleanVar(value=False)
         self.lure_mod_alt_var = tk.BooleanVar(value=False)
@@ -289,10 +289,10 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.grid(row=1, column=4, sticky="w", padx=4, pady=2)
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Intervall (m):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.lure_interval_var = tk.DoubleVar(value=10.0)
+        ttk.Label(trigger_frame, text="Intervall (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
+        self.lure_interval_var = tk.DoubleVar(value=600.0)
         lure_interval_spinbox = ttk.Spinbox(
-            trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.lure_interval_var, width=6
+            trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
         )
         lure_interval_spinbox.grid(row=1, column=6, sticky="w", padx=4, pady=2)
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
@@ -669,8 +669,8 @@ class TriggerEditor(tk.Tk):
         lure_main_key = settings.get("lure_main_key")
         if lure_main_key in keys.MAIN_KEYS:
             self.lure_main_key_var.set(lure_main_key)
-        if "lure_interval_minutes" in settings:
-            self.lure_interval_var.set(float(settings["lure_interval_minutes"]))
+        if "lure_interval_seconds" in settings:
+            self.lure_interval_var.set(float(settings["lure_interval_seconds"]))
 
         self.attack_mod_ctrl_var.set(bool(settings.get("attack_mod_ctrl", False)))
         self.attack_mod_alt_var.set(bool(settings.get("attack_mod_alt", False)))
@@ -699,7 +699,7 @@ class TriggerEditor(tk.Tk):
             "lure_mod_alt": self.lure_mod_alt_var.get(),
             "lure_mod_shift": self.lure_mod_shift_var.get(),
             "lure_main_key": self.lure_main_key_var.get(),
-            "lure_interval_minutes": self.lure_interval_var.get(),
+            "lure_interval_seconds": self.lure_interval_var.get(),
             "attack_mod_ctrl": self.attack_mod_ctrl_var.get(),
             "attack_mod_alt": self.attack_mod_alt_var.get(),
             "attack_mod_shift": self.attack_mod_shift_var.get(),
@@ -916,14 +916,14 @@ class TriggerEditor(tk.Tk):
         # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
         if self.monitor is None:
             return
-        interval_minutes = float(self.lure_interval_var.get())
-        # 0 Minuten schaltet das Intervall ab - kein automatisches Senden.
+        interval_seconds = float(self.lure_interval_var.get())
+        # 0 Sekunden schaltet das Intervall ab - kein automatisches Senden.
         if (
-            interval_minutes > 0
+            interval_seconds > 0
             and self.lure_last_used_at is not None
-            and time.perf_counter() - self.lure_last_used_at >= interval_minutes * 60.0
+            and time.perf_counter() - self.lure_last_used_at >= interval_seconds
         ):
-            self._log(f"Lure interval elapsed ({interval_minutes:.0f} min).")
+            self._log(f"Lure interval elapsed ({interval_seconds:.0f}s).")
             self._send_lure_signal()
         self.after(LURE_TIMER_CHECK_MS, self._check_lure_timer)
 
