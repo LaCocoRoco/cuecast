@@ -81,10 +81,6 @@ ANGEL_TRIGGER_TIMEOUT_CHECK_MS = 1000
 # bereits nach dieser kurzen Anlaufzeit erstmals an (siehe _toggle_monitoring).
 ANGEL_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
 
-# Wie oft geprüft wird, ob das Lure-Intervall abgelaufen ist (siehe _check_lure_timer) - keine
-# Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
-LURE_TIMER_CHECK_MS = 1000
-
 # Wie oft geprüft wird, ob das Attack-Intervall abgelaufen ist (siehe _check_attack_timer) -
 # keine Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
 ATTACK_TIMER_CHECK_MS = 1000
@@ -271,9 +267,11 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             angel_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Zeile 1: Lure Trigger - gleicher Aufbau wie Angel Trigger, aber eigenes Signal, das
-        # automatisch nach Ablauf des Intervalls (Sekunden) erneut gesendet wird, um den Köder
-        # aufzufrischen - siehe _check_lure_timer. 0 schaltet das Intervall ab.
+        # Zeile 1: Lure Trigger - gleicher Aufbau wie Angel Trigger, aber eigenes Signal, um
+        # den Köder aufzufrischen. Kein eigener Timer: wird nur verwendet, wenn ein echter
+        # Biss erkannt wurde UND seit der letzten Verwendung mindestens dieses Intervall
+        # (Sekunden) vergangen ist - dann zwischen Fangen- und Auswerfen-Signal (siehe
+        # _run_angel_trigger). 0 schaltet ab.
         ttk.Label(trigger_frame, text="Lure Trigger:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
         self.lure_mod_ctrl_var = tk.BooleanVar(value=False)
         self.lure_mod_alt_var = tk.BooleanVar(value=False)
@@ -794,8 +792,10 @@ class TriggerEditor(tk.Tk):
         self.last_cast_at = time.perf_counter() - (angel_timeout - ANGEL_TRIGGER_INITIAL_DELAY_SECONDS)
         self._check_angel_trigger_timeout()
 
+        # Kein eigener periodischer Timer mehr - Lure wird nur noch im Rahmen eines echten
+        # Bisses verwendet (siehe _on_trigger_fired/_run_angel_trigger), lure_last_used_at
+        # dient dort nur als Referenzzeitpunkt fuer "ist die Wartezeit abgelaufen".
         self.lure_last_used_at = time.perf_counter()
-        self._check_lure_timer()
 
         self.attack_last_used_at = time.perf_counter()
         self._check_attack_timer()
@@ -858,14 +858,28 @@ class TriggerEditor(tk.Tk):
         self.trigger_count += 1
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
         self._save_settings()
-        threading.Thread(target=self._run_angel_trigger, daemon=True).start()
+        # Entscheidung hier (Hauptthread) treffen, nicht erst im Hintergrund-Thread von
+        # _run_angel_trigger - Tk-Variablen (self.lure_interval_var) sollten nur vom
+        # Hauptthread aus gelesen werden.
+        lure_interval = float(self.lure_interval_var.get())
+        use_lure = (
+            lure_interval > 0
+            and self.lure_last_used_at is not None
+            and time.perf_counter() - self.lure_last_used_at >= lure_interval
+        )
+        threading.Thread(target=self._run_angel_trigger, args=(use_lure,), daemon=True).start()
 
-    def _run_angel_trigger(self):
+    def _run_angel_trigger(self, use_lure):
         # Läuft in einem eigenen Thread, damit die Wartezeiten (bis zu ~2.5s) nicht die
         # Tkinter-Oberfläche blockieren. Das eigentliche Senden + Loggen wird per self.after
         # auf den Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher).
         time.sleep(random.uniform(*ANGEL_TRIGGER_FIRST_DELAY_RANGE))
         self.after(0, self._send_angel_signal)
+        if use_lure:
+            # Lure wird zwischen Fangen- und Auswerfen-Signal verwendet - muss also vor dem
+            # erneuten Auswerfen passieren (siehe _send_lure_signal, setzt lure_last_used_at
+            # zurueck).
+            self.after(0, self._send_lure_signal)
         time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
         time.sleep(random.uniform(*ANGEL_TRIGGER_SECOND_DELAY_RANGE))
         self.after(0, self._send_angel_signal)
@@ -899,7 +913,7 @@ class TriggerEditor(tk.Tk):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
         # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Bewusst
         # simpel und komplett unabhängig vom Angel-Trigger-Timeout/Threshold - löst einfach im
-        # eingestellten Intervall aus, wie Lure Trigger (siehe _check_lure_timer). 0 schaltet ab.
+        # eingestellten Intervall aus. 0 schaltet ab.
         if self.monitor is None:
             return
         interval_seconds = float(self.attack_interval_var.get())
@@ -910,22 +924,6 @@ class TriggerEditor(tk.Tk):
         ):
             self._send_attack_signal()
         self.after(ATTACK_TIMER_CHECK_MS, self._check_attack_timer)
-
-    def _check_lure_timer(self):
-        # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
-        if self.monitor is None:
-            return
-        interval_seconds = float(self.lure_interval_var.get())
-        # 0 Sekunden schaltet das Intervall ab - kein automatisches Senden.
-        if (
-            interval_seconds > 0
-            and self.lure_last_used_at is not None
-            and time.perf_counter() - self.lure_last_used_at >= interval_seconds
-        ):
-            self._log(f"Lure interval elapsed ({interval_seconds:.0f}s).")
-            self._send_lure_signal()
-        self.after(LURE_TIMER_CHECK_MS, self._check_lure_timer)
 
     def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var):
         key = key_var.get()
