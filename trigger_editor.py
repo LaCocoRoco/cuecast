@@ -878,25 +878,22 @@ class TriggerEditor(tk.Tk):
                 and time.perf_counter() - self.last_cast_at >= angel_timeout
             ):
                 self.last_cast_at = time.perf_counter()
+                # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
+                # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus).
+                # Ein zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort
+                # wieder abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt
+                # dauerhaft nichts ausgeworfen und der Timeout feuert immer wieder
+                # ergebnislos. Mit nur einem Druck pro Timeout pendelt sich der Zustand über
+                # die nächsten Zyklen von selbst ein.
+                self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+                self._send_angel_signal()
                 if self.attack_enabled_var.get():
-                    # Vermutlich durch einen Angriff unterbrochen - statt nur einmal zu
-                    # reagieren, wird jetzt wiederholt angegriffen (siehe _run_attack_loop),
-                    # bis wieder ein echter Biss (Threshold) erkannt wird (siehe
-                    # _on_trigger_fired).
-                    self._log(f"No bite within {angel_timeout:.0f}s - attacking.")
+                    # Erst danach: vermutlich durch einen Angriff unterbrochen - wiederholt
+                    # angreifen (siehe _run_attack_loop), bis wieder ein echter Biss
+                    # (Threshold) erkannt wird (siehe _on_trigger_fired).
+                    self._log("Starting attack loop.")
                     self.is_attacking = True
                     self._run_attack_loop()
-                else:
-                    # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt
-                    # wie ein Umschalter (fischt gerade -> wird abgebrochen, fischt nicht ->
-                    # wirft aus). Ein zweiter Druck kurz danach würde einen frisch
-                    # gestarteten Wurf sofort wieder abbrechen (Taste toggelt zurück in den
-                    # Ausgangszustand) - dann bleibt dauerhaft nichts ausgeworfen und der
-                    # Timeout feuert immer wieder ergebnislos. Mit nur einem Druck pro
-                    # Timeout pendelt sich der Zustand über die nächsten Zyklen von selbst
-                    # ein.
-                    self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
-                    self._send_angel_signal()
         self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
 
     def _run_attack_loop(self):
