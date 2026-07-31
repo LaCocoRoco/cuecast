@@ -69,10 +69,9 @@ WAVEFORM_HEIGHT = 100
 # Wartezeit (Sekunden, zufällig aus diesem Bereich) vor dem Fangen-Signal, nachdem ein Biss
 # erkannt wurde - wirkt menschlicher als eine exakte Reaktionszeit.
 ANGEL_TRIGGER_FIRST_DELAY_RANGE = (0.0, 1.0)
-# Feste Pause zwischen Fangen-Signal und erneutem Auswerfen.
-ANGEL_TRIGGER_FIXED_DELAY = 1.5
-# Wartezeit (zufällig) vor dem erneuten Auswerfen-Signal.
-ANGEL_TRIGGER_SECOND_DELAY_RANGE = (0.0, 1.0)
+# Feste Pause zwischen Fangen-Signal und erneutem Auswerfen. Keine zusätzliche variable
+# Wartezeit mehr danach - direkt nach dieser Pause wird erneut ausgeworfen.
+ANGEL_TRIGGER_FIXED_DELAY = 1
 # Timeout selbst ist über "Timeout (s)" in der Oberfläche einstellbar (self.angel_timeout_var).
 # Wie oft der Timeout geprüft wird - keine Zeitkonstante des Ablaufs selbst, muss i.d.R.
 # nicht angepasst werden.
@@ -87,6 +86,12 @@ ATTACK_TIMER_CHECK_MS = 1000
 
 # Cooldown ist bewusst fix (keine UI/Settings) - Zeit zwischen zwei Live-Erkennungstreffern.
 COOLDOWN_SECONDS = 2.0
+
+# Der Lure selbst verursacht beim Auftreffen im Wasser ein Platsch-Geräusch, das den
+# Threshold erneut überschreitet - ohne diese Sperre würde das eine neue, überlappende
+# Angel-Trigger-Sequenz auslösen, während die durch den Lure ausgelöste noch läuft (siehe
+# _on_trigger_fired).
+LURE_SPLASH_IGNORE_SECONDS = 2.0
 
 
 class TriggerEditor(tk.Tk):
@@ -118,6 +123,11 @@ class TriggerEditor(tk.Tk):
         self.monitor = None
         self.last_cast_at = None
         self.lure_last_used_at = None
+        # Nur gesetzt, wenn der Lure tatsaechlich gesendet wurde (im Gegensatz zu
+        # lure_last_used_at, das bei Start bereits vorbelegt wird) - dient ausschliesslich
+        # dazu, den eigenen Platsch-Ton des Lures nicht als neuen Biss zu werten (siehe
+        # _on_trigger_fired).
+        self.lure_fired_at = None
         self.attack_last_used_at = None
 
         # Trigger-Zähler/Laufzeit: werden über settings.json persistiert (siehe
@@ -287,7 +297,7 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.grid(row=1, column=4, sticky="w", padx=4, pady=2)
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Intervall (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
+        ttk.Label(trigger_frame, text="Delay (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
         self.lure_interval_var = tk.DoubleVar(value=0.0)
         lure_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
@@ -781,6 +791,7 @@ class TriggerEditor(tk.Tk):
             # erkannt wurde.
             self.last_cast_at = None
             self.lure_last_used_at = None
+            self.lure_fired_at = None
             self.attack_last_used_at = None
             # Laufzeit dieses Start-Stop-Abschnitts in die Gesamtsumme einrechnen und
             # persistieren - die Anzeige zaehlt ab jetzt nicht mehr weiter (siehe
@@ -872,7 +883,17 @@ class TriggerEditor(tk.Tk):
         self.after(0, self._on_trigger_fired, db)
 
     def _on_trigger_fired(self, db):
-        self._log(f"Signal triggered ({db:.1f} dB)")
+        # Der Lure selbst platscht beim Auftreffen im Wasser hoerbar auf und wuerde diesen
+        # Trigger sonst sofort wieder ausloesen, waehrend die durch ihn ausgeloeste Sequenz
+        # noch laeuft (siehe LURE_SPLASH_IGNORE_SECONDS) - das war die Ursache der
+        # ueberlappenden, durcheinandergewuerfelten Sende-Reihenfolge.
+        if (
+            self.lure_fired_at is not None
+            and time.perf_counter() - self.lure_fired_at < LURE_SPLASH_IGNORE_SECONDS
+        ):
+            self._log(f"Threshold detected: {db:.1f} dB (ignored, recent lure splash)")
+            return
+        self._log(f"Threshold detected: {db:.1f} dB")
         # Uhr sofort zuruecksetzen (nicht erst am Ende von _run_angel_trigger, das dauert bis
         # zu ~3.5s) - sonst koennte _check_angel_trigger_timeout in der Zwischenzeit mit dem
         # noch alten Zeitstempel erneut (faelschlich) ausloesen.
@@ -900,18 +921,19 @@ class TriggerEditor(tk.Tk):
         )
 
     def _run_angel_trigger(self, use_lure):
-        # Läuft in einem eigenen Thread, damit die Wartezeiten (bis zu ~2.5s) nicht die
-        # Tkinter-Oberfläche blockieren. Das eigentliche Senden + Loggen wird per self.after
-        # auf den Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher).
+        # Läuft in einem eigenen Thread, damit die Wartezeiten nicht die Tkinter-Oberfläche
+        # blockieren. Das eigentliche Senden + Loggen wird per self.after auf den
+        # Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher). Ablauf: Fangen ->
+        # (optional) Lure -> feste Pause -> erneutes Auswerfen. Keine variable Wartezeit vor
+        # dem erneuten Auswerfen mehr.
         time.sleep(random.uniform(*ANGEL_TRIGGER_FIRST_DELAY_RANGE))
         self.after(0, self._send_angel_signal)
         if use_lure:
             # Lure wird zwischen Fangen- und Auswerfen-Signal verwendet - muss also vor dem
             # erneuten Auswerfen passieren (siehe _send_lure_signal, setzt lure_last_used_at
-            # zurueck).
+            # zurueck, worauf _on_trigger_fired die LURE_SPLASH_IGNORE_SECONDS-Sperre stützt).
             self.after(0, self._send_lure_signal)
         time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
-        time.sleep(random.uniform(*ANGEL_TRIGGER_SECOND_DELAY_RANGE))
         self.after(0, self._send_angel_signal)
         # Neuer Wurf beginnt jetzt - die Timeout-Uhr (siehe _check_angel_trigger_timeout)
         # läuft ab hier wieder von vorne.
@@ -967,10 +989,10 @@ class TriggerEditor(tk.Tk):
         finally:
             self.after(ATTACK_TIMER_CHECK_MS, self._check_attack_timer)
 
-    def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var):
+    def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var, trigger_name):
         key = key_var.get()
         if not key:
-            self._log("No signal configured.")
+            self._log(f"No signal configured ({trigger_name}).")
             return
         modifiers = [
             name for name, var in (
@@ -982,27 +1004,31 @@ class TriggerEditor(tk.Tk):
         label = "+".join(m.capitalize() for m in modifiers + [key])
         try:
             self.input_controller.send_combo(key, modifiers)
-            self._log(f"Sent '{label}'.")
+            self._log(f"Sent '{label}' ({trigger_name}).")
         except Exception as exc:
-            self._log(f"Send error: {exc}")
+            self._log(f"Send error ({trigger_name}): {exc}")
 
     def _send_angel_signal(self):
-        self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var)
+        self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var, "Angel Trigger")
 
     def _send_attack_signal(self):
         # Uhr zuruecksetzen, damit das naechste automatische Feuern wieder das volle
         # Intervall ab jetzt abwartet.
         self.attack_last_used_at = time.perf_counter()
         self._send_signal(
-            self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var
+            self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var,
+            "Attack Trigger",
         )
 
     def _send_lure_signal(self):
-        # Uhr zuruecksetzen, damit das naechste automatische Feuern wieder das volle
-        # Intervall ab jetzt abwartet.
+        # Uhr zuruecksetzen, damit die naechste Verwendung wieder das volle Delay ab jetzt
+        # abwartet. lure_fired_at markiert zusaetzlich, dass der Lure JETZT tatsaechlich
+        # gesendet wurde - dient _on_trigger_fired dazu, den eigenen Platsch-Ton zu ignorieren.
         self.lure_last_used_at = time.perf_counter()
+        self.lure_fired_at = time.perf_counter()
         self._send_signal(
-            self.lure_mod_ctrl_var, self.lure_mod_alt_var, self.lure_mod_shift_var, self.lure_main_key_var
+            self.lure_mod_ctrl_var, self.lure_mod_alt_var, self.lure_mod_shift_var, self.lure_main_key_var,
+            "Lure Trigger",
         )
 
     def _log(self, message):

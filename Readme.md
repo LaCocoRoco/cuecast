@@ -1,48 +1,48 @@
-# Audioanalyse
+# Cuecast
 
-Template-/Kreuzkorrelations-Matching
+Audio-threshold-based trigger tool: listens to loopback audio, and reacts to loud events by
+sending configured key combinations (via the Interception HID driver). Originally built
+around a WoW fishing use case, hence the "Angel" (fishing rod) / "Lure" / "Attack"
+terminology.
 
-# Eingabe
+## Audio detection
 
-Virtual HID Treiber
+A block of incoming audio is high-pass filtered (removes low-frequency background noise like
+ambient rumble/fire crackling) and compared against a fixed dB threshold ("Threshold" in the
+UI). No waveform/template matching - real in-game sounds vary too much in timing/pitch for
+reliable cross-correlation, but are consistently louder than the silence/background noise
+between them.
 
-# Eingabe Alternative
+## The main loop
 
-PostMessage/SendInput (Wird vorerst nicht verwendet)
+```
+Start
+  -> short warm-up (5s, fixed) before the timeout routine engages
+  -> Angel Trigger: cast
 
-# Ansatz Idee Aufwand Robustheit
+Threshold detected
+  -> wait 0-1s (randomized, feels more human than an instant reaction)
+  -> Angel Trigger: reel in
+  -> if Lure Delay > 0 and enough time has passed since the last Lure use:
+       -> Lure Trigger: use lure
+       -> ignore the Threshold for 2s afterwards (the lure itself makes a splash
+          when it hits the water, which would otherwise immediately re-trigger
+          this whole sequence)
+  -> fixed pause (1s)
+  -> Angel Trigger: cast again
 
-Fixer Schwellwert (aktuell)
-Lautstärke > konstanter dB-Wert
-minimal niedrig
-jedes laute Geräusch triggert
+Timeout (no bite within the configured time)
+  -> Angel Trigger: cast (acts like a toggle - if still "fishing", this
+     interrupts it; the loop naturally recovers on the next cycle)
+```
 
-# Adaptiver/relativer Schwellwert
+Attack Trigger runs completely independently of the above: as long as its own interval is
+set above 0, it just presses its configured key on that interval, the whole time monitoring
+is active.
 
-Trigger bei "X dB über gleitendem Durchschnitt/Median der letzten Sekunden" statt festem Wert
-gering
-mittel – passt sich an Umgebungslautstärke an, löst aber immer noch bei jedem Geräusch aus
+## Settings
 
-# Bandpass-gefilterte Energie
-
-Nur den Frequenzbereich analysieren, in dem der Splash-Sound tatsächlich Energie hat (FFT/Filter vor RMS)
-mittel
-mittel-hoch – filtert z.B. tiefe Musik-Bässe oder hohe UI-Pings raus
-
-# Template-/Kreuzkorrelations-Matching
-
-Einmal eine Referenzaufnahme des echten Splash-Sounds machen, eingehende Blöcke per Kreuzkorrelation dagegen vergleichen
-mittel-hoch
-hoch – erkennt spezifisch dieses Geräusch statt "irgendwas Lautes"
-
-# Onset-/Spectral-Flux-Detection (z.B. librosa)
-
-Aus der Musikanalyse geliehene Verfahren zur Erkennung plötzlicher Klangeinsätze
-hoch
-hoch, aber mehr Abhängigkeiten/Rechenaufwand
-
-# Bildbasiert statt Audio
-
-Screenshot/Pixelanalyse auf die Angel-Bobber-Animation statt Ton
-mittel-hoch
-umgeht das Audio-Problem komplett, dafür empfindlich gegenüber Kamerawinkel/UI-Position
+All key combinations (modifiers + main key), the Threshold, and the various timing values
+(Angel Timeout, Lure Delay, Attack Interval) are configurable in the UI and persisted in
+`settings.json`, keyed per value - a value missing from a fresh `settings.json` simply falls
+back to its built-in default.
