@@ -17,10 +17,9 @@ import keys
 import vbcable_driver
 from audio_devices import list_speakers, resolve_speaker
 from key_sender import InputController
-from matcher import LiveMonitor, compute_db
+from matcher import LiveMonitor, compute_peak_db
 from record_snippet import SNIPPET_DIR, record, save_wav
 from settings import load_settings, save_settings
-from windows import list_windows
 from theme import (
     ACCENT,
     BG,
@@ -36,10 +35,16 @@ from theme import (
 
 PREVIEW_PATH = Path(__file__).parent / "_preview.wav"
 
-# Klicks (keine echte Auswahl) sind kürzer als das hier, in Sekunden. 0.02s (~2 Pixel bei
-# typischer Fensterbreite) war zu knapp bemessen für echtes Maus-Zittern bei einem Klick.
-CLICK_EPSILON = 0.08
+# Klicks (keine echte Auswahl) sind kürzer als das hier, in Sekunden. War vorher 0.08s -
+# das hat aber echte, kurze Markierungen (z.B. kurze Splash-Transienten < 80ms) fälschlich
+# als Klick statt als Auswahl behandelt. 0.03s ist ein Kompromiss zwischen beidem.
+CLICK_EPSILON = 0.03
 PLAYHEAD_INTERVAL_MS = 30
+
+# Sicherheitspolster (fixe dB-Differenz, keine Prozentangabe - siehe compute_peak_db) unter
+# dem gemessenen Peak einer markierten Auswahl, wenn sie per Button als Threshold übernommen
+# wird.
+THRESHOLD_SUGGESTION_MARGIN_DB = 3.0
 
 # Mindest-/Standardgröße des Fensters (Pixel). Muss mindestens so groß sein wie der
 # tatsächliche Platzbedarf der Steuerelemente (siehe winfo_reqwidth/reqheight).
@@ -57,22 +62,36 @@ ROW_HEIGHT = 33
 # Feste Höhe der Wellenform-Anzeige (Pixel) - ändert sich nicht mit der Fenstergröße.
 WAVEFORM_HEIGHT = 100
 
-AUTOMATION_DEFAULT = "Default"
-AUTOMATION_WOW = "World of Warcraft"
+# ============================================================================
+# Angel-Trigger-Timing - bewusst alles hier an einer Stelle zum Feinjustieren im Code, nicht
+# über UI/Settings (siehe _run_angel_trigger/_check_angel_trigger_timeout für die Verwendung).
+# ============================================================================
+# Wartezeit (Sekunden, zufällig aus diesem Bereich) vor dem Fangen-Signal, nachdem ein Biss
+# erkannt wurde - wirkt menschlicher als eine exakte Reaktionszeit.
+ANGEL_TRIGGER_FIRST_DELAY_RANGE = (0.0, 1.0)
+# Feste Pause zwischen Fangen-Signal und erneutem Auswerfen.
+ANGEL_TRIGGER_FIXED_DELAY = 1.5
+# Wartezeit (zufällig) vor dem erneuten Auswerfen-Signal.
+ANGEL_TRIGGER_SECOND_DELAY_RANGE = (0.0, 1.0)
+# Timeout selbst ist über "Timeout (s)" in der Oberfläche einstellbar (self.angel_timeout_var).
+# Wie oft der Timeout geprüft wird - keine Zeitkonstante des Ablaufs selbst, muss i.d.R.
+# nicht angepasst werden.
+ANGEL_TRIGGER_TIMEOUT_CHECK_MS = 1000
+# Bei Start wird nicht auf den ersten echten Biss gewartet - die Routine läuft stattdessen
+# bereits nach dieser kurzen Anlaufzeit erstmals an (siehe _toggle_monitoring).
+ANGEL_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
 
-# World-of-Warcraft-Automation: zweimal auslösen (Fangen + Looten) mit menschlich wirkenden,
-# zufälligen Verzögerungen statt exaktem Timing. Werte vorerst fix im Code, sollen später bei
-# Bedarf noch verfeinert/konfigurierbar werden.
-AUTOMATION_WOW_FIRST_DELAY_RANGE = (0.0, 1.0)
-AUTOMATION_WOW_FIXED_DELAY = 0.5
-AUTOMATION_WOW_SECOND_DELAY_RANGE = (0.0, 1.0)
+# Ist Attack Trigger aktiviert, wird bei einem Timeout (vermutlich durch einen Angriff
+# unterbrochenes Fischen) nicht nur einmal, sondern in diesem Intervall wiederholt
+# angegriffen, bis wieder ein echter Biss (Threshold) erkannt wird - siehe _run_attack_loop.
+ATTACK_TRIGGER_INTERVAL_SECONDS = 2.0
 
-# Ein Wurf dauert in WoW maximal ~22s. Wird lange kein Biss (Trigger) erkannt, drücken wir
-# die Taste einmal (siehe _check_wow_timeout) - Sicherheitsnetz gegen "hängengebliebene"
-# Würfe. Der genaue Wert ist über "Timeout (s)" in der Oberfläche einstellbar, das hier ist
-# nur der Default.
-AUTOMATION_WOW_TIMEOUT_DEFAULT = 30.0
-AUTOMATION_WOW_TIMEOUT_CHECK_MS = 1000
+# Wie oft geprüft wird, ob das Lure-Intervall abgelaufen ist (siehe _check_lure_timer) - keine
+# Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
+LURE_TIMER_CHECK_MS = 1000
+
+# Cooldown ist bewusst fix (keine UI/Settings) - Zeit zwischen zwei Live-Erkennungstreffern.
+COOLDOWN_SECONDS = 2.0
 
 
 class TriggerEditor(tk.Tk):
@@ -103,19 +122,24 @@ class TriggerEditor(tk.Tk):
 
         self.monitor = None
         self.last_cast_at = None
+        self.lure_last_used_at = None
+        self.is_attacking = False
+
+        # Trigger-Zähler/Laufzeit: werden über settings.json persistiert (siehe
+        # _load_settings/_save_settings), Zurücksetzen nur explizit über den Reset-Button.
+        self.trigger_count = 0
+        self.total_runtime_seconds = 0.0
+        self.session_started_at = None  # perf_counter()-Zeitpunkt des laufenden Start-Stop-Abschnitts
 
         self.input_controller = InputController()
-        self.input_windows = []
 
         apply_dark_theme(self)
         self._build_widgets()
         self._load_settings()
         self._refresh_file_list()
-        self._refresh_input_windows()
+        self._refresh_hid_status()
         self._refresh_vbcable_status()
-
-        if self.autostart_var.get():
-            self._toggle_monitoring()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_widgets(self):
         # Gerät/Snippets-Zeilen als gemeinsames Raster, damit Spalten
@@ -182,112 +206,123 @@ class TriggerEditor(tk.Tk):
             props=dict(alpha=0.3, facecolor=SELECTION_COLOR),
         )
 
-        # Zeigt die (hochpass-gefilterte) Lautstärke der per Maus gezogenen Auswahl in dBFS -
-        # gleiche Berechnung wie die Live-Erkennung (siehe matcher.compute_db), damit man an
-        # einer echten Aufnahme direkt einen sinnvollen Threshold ablesen kann.
+        # Zeigt den lautesten Block (gleiche Blockgröße wie die Live-Erkennung, siehe
+        # matcher.compute_peak_db) der per Maus gezogenen Auswahl in dBFS - der Button
+        # übernimmt Peak minus Sicherheitspolster direkt als Threshold.
+        selection_row = ttk.Frame(self)
+        selection_row.pack(side="top", fill="x", padx=8)
         self.selection_db_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.selection_db_var).pack(side="top", anchor="w", padx=8)
+        ttk.Label(selection_row, textvariable=self.selection_db_var).pack(side="left")
+        self.apply_threshold_button = ttk.Button(
+            selection_row, text="Als Threshold übernehmen", command=self._apply_selection_as_threshold
+        )
+        self.apply_threshold_button.pack(side="left", padx=(8, 0))
 
-        # Input Manager: Post Message braucht ein Ziel-Fenster, Human Interface Device
-        # geht immer an das fokussierte Fenster (siehe input_tester.py).
+        # HID (Interception-Treiber, geht immer an das fokussierte Fenster) - Status +
+        # Install/Uninstall + schneller manueller Test.
         input_frame = ttk.Frame(self, height=ROW_HEIGHT)
         input_frame.pack_propagate(False)
         input_frame.pack(side="top", fill="x", padx=8, pady=4)
 
-        ttk.Label(input_frame, text="Input Manager:").pack(side="left")
-        self.input_manager_var = tk.StringVar(value=InputController.HID_VARIANT)
-        self.input_manager_combo = ttk.Combobox(
-            input_frame,
-            textvariable=self.input_manager_var,
-            values=[InputController.HID_VARIANT, InputController.POST_MESSAGE_VARIANT],
-            state="readonly",
-            width=20,
-        )
-        self.input_manager_combo.pack(side="left", padx=4)
-        self.input_manager_combo.bind("<<ComboboxSelected>>", lambda event: self._on_input_manager_change())
-
-        # Schneller manueller Test des gerade gewählten Input Managers - sendet die
-        # Windows-Taste (leicht sichtbar: öffnet/schließt das Startmenü), unabhängig vom
-        # unten konfigurierten Automation-Signal. Referenz gespeichert, damit die Fenster-/
-        # Treiber-Zeile unten per before= immer davor eingefügt wird (unabhängig davon, wie
-        # oft zwischen den beiden Varianten hin- und hergeschaltet wird).
-        self.test_button = ttk.Button(input_frame, text="Test", width=BUTTON_WIDTH, command=self._test_input_manager)
-        self.test_button.pack(side="left", padx=(16, 4))
-
-        # Eigener Rahmen, damit die Fensterauswahl bei Human Interface Device komplett
-        # ausgeblendet werden kann (dort nicht zutreffend - es geht ans fokussierte Fenster).
-        self.input_window_row = ttk.Frame(input_frame)
-        self.input_window_row.pack(side="left", fill="x", expand=True, before=self.test_button)
-
-        ttk.Label(self.input_window_row, text="Window:").pack(side="left", padx=(16, 4))
-        ttk.Button(
-            self.input_window_row, text="Refresh", width=BUTTON_WIDTH, command=self._refresh_input_windows
-        ).pack(side="right", padx=4)
-        self.input_window_var = tk.StringVar()
-        self.input_window_combo = ttk.Combobox(
-            self.input_window_row, textvariable=self.input_window_var, state="readonly"
-        )
-        self.input_window_combo.pack(side="left", fill="x", expand=True, padx=4)
-        self.input_window_combo.bind("<<ComboboxSelected>>", lambda event: self._on_input_manager_change())
-
-        # Eigener Rahmen für den Interception-Treiber-Status - nur bei Human Interface
-        # Device relevant (spiegelbildlich zur Fensterauswahl bei Post Message).
-        self.hid_driver_row = ttk.Frame(input_frame)
-        self.hid_driver_row.pack(side="left", fill="x", expand=True, before=self.test_button)
-
-        self.hid_status_var = tk.StringVar(value="Driver: ?")
-        ttk.Label(self.hid_driver_row, textvariable=self.hid_status_var).pack(side="left", padx=(16, 4))
+        self.hid_status_var = tk.StringVar(value="HID Driver: ?")
+        ttk.Label(input_frame, textvariable=self.hid_status_var).pack(side="left")
         self.hid_driver_button = ttk.Button(
-            self.hid_driver_row, text="Install", width=BUTTON_WIDTH, command=self._toggle_hid_driver
+            input_frame, text="Install", width=BUTTON_WIDTH, command=self._toggle_hid_driver
         )
-        self.hid_driver_button.pack(side="right", padx=4)
+        self.hid_driver_button.pack(side="left", padx=4)
 
-        # Automation: Was bei einem Audio-Treffer passiert. Default sendet das konfigurierte
-        # Signal über den gewählten Input Manager - World of Warcraft ist als Platzhalter
-        # für eine spätere statische Tastensequenz vorgesehen.
-        automation_frame = ttk.Frame(self, height=ROW_HEIGHT)
-        automation_frame.pack_propagate(False)
-        automation_frame.pack(side="top", fill="x", padx=8, pady=(0, 4))
-
-        ttk.Label(automation_frame, text="Automation:").pack(side="left")
-        self.automation_var = tk.StringVar(value=AUTOMATION_DEFAULT)
-        self.automation_combo = ttk.Combobox(
-            automation_frame,
-            textvariable=self.automation_var,
-            values=[AUTOMATION_DEFAULT, AUTOMATION_WOW],
-            state="readonly",
-            width=20,
+        # Sendet die Windows-Taste (leicht sichtbar: öffnet/schließt das Startmenü), um HID
+        # unabhängig von den unten konfigurierten Signalen schnell zu testen.
+        ttk.Button(input_frame, text="Test", width=BUTTON_WIDTH, command=self._test_input_manager).pack(
+            side="left", padx=(16, 4)
         )
-        self.automation_combo.pack(side="left", padx=4)
-        self.automation_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(automation_frame, text="Signal:").pack(side="left", padx=(16, 0))
+        # Angel Trigger (Zeile 0) + Lure Trigger (Zeile 1): gemeinsames Grid, damit
+        # Checkbuttons/Dropdowns beider Zeilen exakt untereinander ausgerichtet sind (wie bei
+        # Device/Snippets oben).
+        trigger_frame = ttk.Frame(self)
+        trigger_frame.pack(side="top", fill="x", padx=8, pady=(0, 4))
+        for row in range(3):
+            trigger_frame.grid_rowconfigure(row, minsize=ROW_HEIGHT)
+
+        # Zeile 0: Angel Trigger - Signal, das bei einem erkannten Biss (Audio-Treffer)
+        # gesendet wird, siehe _run_angel_trigger. Timeout (s): siehe _check_angel_trigger_timeout.
+        ttk.Label(trigger_frame, text="Angel Trigger:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         self.mod_ctrl_var = tk.BooleanVar(value=False)
         self.mod_alt_var = tk.BooleanVar(value=False)
         self.mod_shift_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(automation_frame, text="Ctrl", variable=self.mod_ctrl_var, command=self._save_settings).pack(side="left", padx=4)
-        ttk.Checkbutton(automation_frame, text="Alt", variable=self.mod_alt_var, command=self._save_settings).pack(side="left", padx=4)
-        ttk.Checkbutton(automation_frame, text="Shift", variable=self.mod_shift_var, command=self._save_settings).pack(side="left", padx=4)
+        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.mod_ctrl_var, command=self._save_settings).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.mod_alt_var, command=self._save_settings).grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.mod_shift_var, command=self._save_settings).grid(row=0, column=3, sticky="w", padx=4, pady=2)
 
         self.main_key_var = tk.StringVar(value="F6")
         self.main_key_combo = ttk.Combobox(
-            automation_frame, textvariable=self.main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
+            trigger_frame, textvariable=self.main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
         )
-        self.main_key_combo.pack(side="left", padx=4)
+        self.main_key_combo.grid(row=0, column=4, sticky="w", padx=4, pady=2)
         self.main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        # Sicherheitsnetz nur für die World-of-Warcraft-Automation (siehe _check_wow_timeout) -
-        # wird live gelesen, kein Neustart der Erkennung nötig.
-        ttk.Label(automation_frame, text="Timeout (s):").pack(side="left", padx=(16, 0))
-        self.wow_timeout_var = tk.DoubleVar(value=AUTOMATION_WOW_TIMEOUT_DEFAULT)
-        wow_timeout_spinbox = ttk.Spinbox(
-            automation_frame, from_=10.0, to=60.0, increment=5.0, textvariable=self.wow_timeout_var, width=6
+        ttk.Label(trigger_frame, text="Timeout (s):").grid(row=0, column=5, sticky="w", padx=(16, 4), pady=2)
+        self.angel_timeout_var = tk.DoubleVar(value=22.0)
+        angel_timeout_spinbox = ttk.Spinbox(
+            trigger_frame, from_=5.0, to=60.0, increment=1.0, textvariable=self.angel_timeout_var, width=6
         )
-        wow_timeout_spinbox.pack(side="left", padx=4)
+        angel_timeout_spinbox.grid(row=0, column=6, sticky="w", padx=4, pady=2)
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
-            wow_timeout_spinbox.bind(event, lambda e: self._save_settings())
+            angel_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Live-Erkennung: Threshold/Cooldown/Start + Log
+        # Zeile 1: Lure Trigger - gleicher Aufbau wie Angel Trigger, aber eigenes Signal, das
+        # automatisch nach Ablauf des Intervalls (Minuten) erneut gesendet wird, um den Köder
+        # aufzufrischen - siehe _check_lure_timer. 0 Minuten schaltet das Intervall ab.
+        ttk.Label(trigger_frame, text="Lure Trigger:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.lure_mod_ctrl_var = tk.BooleanVar(value=False)
+        self.lure_mod_alt_var = tk.BooleanVar(value=False)
+        self.lure_mod_shift_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.lure_mod_ctrl_var, command=self._save_settings).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.lure_mod_alt_var, command=self._save_settings).grid(row=1, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.lure_mod_shift_var, command=self._save_settings).grid(row=1, column=3, sticky="w", padx=4, pady=2)
+
+        self.lure_main_key_var = tk.StringVar(value="F7")
+        self.lure_main_key_combo = ttk.Combobox(
+            trigger_frame, textvariable=self.lure_main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
+        )
+        self.lure_main_key_combo.grid(row=1, column=4, sticky="w", padx=4, pady=2)
+        self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
+
+        ttk.Label(trigger_frame, text="Minutes:").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
+        self.lure_interval_var = tk.DoubleVar(value=10.0)
+        lure_interval_spinbox = ttk.Spinbox(
+            trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.lure_interval_var, width=6
+        )
+        lure_interval_spinbox.grid(row=1, column=6, sticky="w", padx=4, pady=2)
+        for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+            lure_interval_spinbox.bind(event, lambda e: self._save_settings())
+
+        # Zeile 2: Attack Trigger - gleicher Aufbau wie Angel/Lure Trigger. Ist Enable aktiv,
+        # wird dieses Signal beim Angel-Trigger-Timeout (siehe _check_angel_trigger_timeout)
+        # zuerst gesendet, bevor die Angel erneut ausgeworfen wird (z.B. um einen aus dem
+        # Wasser gesprungenen Gegner zuerst zu bekämpfen).
+        ttk.Label(trigger_frame, text="Attack Trigger:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.attack_mod_ctrl_var = tk.BooleanVar(value=False)
+        self.attack_mod_alt_var = tk.BooleanVar(value=False)
+        self.attack_mod_shift_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(trigger_frame, text="Ctrl", variable=self.attack_mod_ctrl_var, command=self._save_settings).grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Alt", variable=self.attack_mod_alt_var, command=self._save_settings).grid(row=2, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(trigger_frame, text="Shift", variable=self.attack_mod_shift_var, command=self._save_settings).grid(row=2, column=3, sticky="w", padx=4, pady=2)
+
+        self.attack_main_key_var = tk.StringVar(value="F8")
+        self.attack_main_key_combo = ttk.Combobox(
+            trigger_frame, textvariable=self.attack_main_key_var, values=keys.MAIN_KEYS, state="readonly", width=8
+        )
+        self.attack_main_key_combo.grid(row=2, column=4, sticky="w", padx=4, pady=2)
+        self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
+
+        self.attack_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            trigger_frame, text="Enable", variable=self.attack_enabled_var, command=self._save_settings
+        ).grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
+
+        # Live-Erkennung: Threshold/Start + Log
         monitor_frame = ttk.Frame(self, height=ROW_HEIGHT)
         monitor_frame.pack_propagate(False)
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
@@ -301,22 +336,22 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             threshold_spinbox.bind(event, lambda e: self._on_monitor_settings_changed())
 
-        ttk.Label(monitor_frame, text="Cooldown (s):").pack(side="left", padx=(16, 0))
-        self.cooldown_var = tk.DoubleVar(value=2.0)
-        cooldown_spinbox = ttk.Spinbox(
-            monitor_frame, from_=0.5, to=10.0, increment=0.5, textvariable=self.cooldown_var, width=6
-        )
-        cooldown_spinbox.pack(side="left", padx=4)
-        for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
-            cooldown_spinbox.bind(event, lambda e: self._on_monitor_settings_changed())
-
         self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
         self.monitor_button.pack(side="left", padx=(16, 4))
 
-        # Startet die Live-Erkennung automatisch, wenn Trigger Editor geöffnet wird (siehe
-        # __init__) - nicht zu verwechseln mit einem Windows-Autostart der Anwendung selbst.
-        self.autostart_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(monitor_frame, text="Autostart", variable=self.autostart_var, command=self._save_settings).pack(side="left", padx=(8, 4))
+        # Trigger-Zähler + Laufzeit: über settings.json persistiert (self.trigger_count/
+        # self.total_runtime_seconds werden bereits in __init__ initialisiert/geladen).
+        self.trigger_count_var = tk.StringVar(value="Triggers: 0")
+        ttk.Label(monitor_frame, textvariable=self.trigger_count_var).pack(side="left", padx=(16, 4))
+
+        # Laufzeit zählt nur, solange die Erkennung aktiv ist (Start gedrückt), pausiert bei
+        # Stop - siehe _update_runtime_display/_toggle_monitoring.
+        self.runtime_var = tk.StringVar(value="Runtime: 0h 00m")
+        ttk.Label(monitor_frame, textvariable=self.runtime_var).pack(side="left", padx=(8, 4))
+
+        ttk.Button(monitor_frame, text="Reset", width=BUTTON_WIDTH, command=self._reset_counters).pack(
+            side="left", padx=(8, 4)
+        )
 
         self.log_text = tk.Text(
             self, height=6, bg=BG_PANEL, fg=FG, insertbackground=FG,
@@ -328,7 +363,7 @@ class TriggerEditor(tk.Tk):
         grid_width = max(
             controls.winfo_reqwidth(),
             input_frame.winfo_reqwidth(),
-            automation_frame.winfo_reqwidth(),
+            trigger_frame.winfo_reqwidth(),
             monitor_frame.winfo_reqwidth(),
         )
         canvas_widget.config(width=grid_width, height=WAVEFORM_HEIGHT)
@@ -492,8 +527,21 @@ class TriggerEditor(tk.Tk):
         if len(segment) == 0:
             self.selection_db_var.set("")
             return
-        db = compute_db(segment, self.sample_rate)
-        self.selection_db_var.set(f"Selection: {end - start:.2f}s, {db:.1f} dB")
+        peak_db = compute_peak_db(segment, self.sample_rate)
+        self.selection_db_var.set(f"Selection: {end - start:.2f}s, Peak {peak_db:.1f} dB")
+
+    def _apply_selection_as_threshold(self):
+        if self.selection is None or self.audio is None:
+            return
+        start_i, end_i, _, _ = self._selected_segment()
+        segment = self.audio[start_i:end_i]
+        if len(segment) == 0:
+            return
+        peak_db = compute_peak_db(segment, self.sample_rate)
+        suggested = round(peak_db - THRESHOLD_SUGGESTION_MARGIN_DB, 1)
+        self.threshold_var.set(suggested)
+        self._on_monitor_settings_changed()
+        self._log(f"Threshold set to {suggested:.1f} dB (peak {peak_db:.1f} dB - {THRESHOLD_SUGGESTION_MARGIN_DB:.0f} dB margin).")
 
     def _determine_range(self):
         if self.selection:
@@ -596,83 +644,74 @@ class TriggerEditor(tk.Tk):
         if device_name and device_name in self.device_combo["values"]:
             self.device_combo.set(device_name)
 
-        input_manager = settings.get("input_manager")
-        if input_manager in (InputController.POST_MESSAGE_VARIANT, InputController.HID_VARIANT):
-            self.input_manager_var.set(input_manager)
-
-        automation = settings.get("automation")
-        if automation in (AUTOMATION_DEFAULT, AUTOMATION_WOW):
-            self.automation_var.set(automation)
-
-        if "autostart" in settings:
-            self.autostart_var.set(bool(settings["autostart"]))
         if "threshold" in settings:
             self.threshold_var.set(float(settings["threshold"]))
-        if "cooldown" in settings:
-            self.cooldown_var.set(float(settings["cooldown"]))
         self.mod_ctrl_var.set(bool(settings.get("mod_ctrl", False)))
         self.mod_alt_var.set(bool(settings.get("mod_alt", False)))
         self.mod_shift_var.set(bool(settings.get("mod_shift", False)))
         main_key = settings.get("main_key")
         if main_key in keys.MAIN_KEYS:
             self.main_key_var.set(main_key)
-        if "wow_timeout" in settings:
-            self.wow_timeout_var.set(float(settings["wow_timeout"]))
+        if "angel_timeout_seconds" in settings:
+            self.angel_timeout_var.set(float(settings["angel_timeout_seconds"]))
+
+        self.lure_mod_ctrl_var.set(bool(settings.get("lure_mod_ctrl", False)))
+        self.lure_mod_alt_var.set(bool(settings.get("lure_mod_alt", False)))
+        self.lure_mod_shift_var.set(bool(settings.get("lure_mod_shift", False)))
+        lure_main_key = settings.get("lure_main_key")
+        if lure_main_key in keys.MAIN_KEYS:
+            self.lure_main_key_var.set(lure_main_key)
+        if "lure_interval_minutes" in settings:
+            self.lure_interval_var.set(float(settings["lure_interval_minutes"]))
+
+        self.attack_mod_ctrl_var.set(bool(settings.get("attack_mod_ctrl", False)))
+        self.attack_mod_alt_var.set(bool(settings.get("attack_mod_alt", False)))
+        self.attack_mod_shift_var.set(bool(settings.get("attack_mod_shift", False)))
+        attack_main_key = settings.get("attack_main_key")
+        if attack_main_key in keys.MAIN_KEYS:
+            self.attack_main_key_var.set(attack_main_key)
+        self.attack_enabled_var.set(bool(settings.get("attack_enabled", False)))
+
+        self.trigger_count = int(settings.get("trigger_count", 0))
+        self.total_runtime_seconds = float(settings.get("total_runtime_seconds", 0.0))
+        self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
+        self._set_runtime_var(self.total_runtime_seconds)
 
     def _save_settings(self):
         save_settings({
             "device": self.device_combo.get(),
-            "input_manager": self.input_manager_var.get(),
-            "automation": self.automation_var.get(),
-            "autostart": self.autostart_var.get(),
             "threshold": self.threshold_var.get(),
-            "cooldown": self.cooldown_var.get(),
             "mod_ctrl": self.mod_ctrl_var.get(),
             "mod_alt": self.mod_alt_var.get(),
             "mod_shift": self.mod_shift_var.get(),
             "main_key": self.main_key_var.get(),
-            "wow_timeout": self.wow_timeout_var.get(),
+            "angel_timeout_seconds": self.angel_timeout_var.get(),
+            "lure_mod_ctrl": self.lure_mod_ctrl_var.get(),
+            "lure_mod_alt": self.lure_mod_alt_var.get(),
+            "lure_mod_shift": self.lure_mod_shift_var.get(),
+            "lure_main_key": self.lure_main_key_var.get(),
+            "lure_interval_minutes": self.lure_interval_var.get(),
+            "attack_mod_ctrl": self.attack_mod_ctrl_var.get(),
+            "attack_mod_alt": self.attack_mod_alt_var.get(),
+            "attack_mod_shift": self.attack_mod_shift_var.get(),
+            "attack_main_key": self.attack_main_key_var.get(),
+            "attack_enabled": self.attack_enabled_var.get(),
+            "trigger_count": self.trigger_count,
+            "total_runtime_seconds": self.total_runtime_seconds,
         })
 
-    # --- Text Input Manager ---
-    def _refresh_input_windows(self):
-        self.input_windows = list_windows()
-        labels = [f"{w.title} — {w.process_name}" for w in self.input_windows]
-        self.input_window_combo.config(values=labels)
-        self._on_input_manager_change()
-
-    def _on_input_manager_change(self):
-        variant = self.input_manager_var.get()
-        is_post_message = variant == InputController.POST_MESSAGE_VARIANT
-
-        if is_post_message:
-            self.input_window_combo.config(state="readonly")
-            self.input_window_row.pack(side="left", fill="x", expand=True, before=self.test_button)
-            self.hid_driver_row.pack_forget()
-        else:
-            self.input_window_row.pack_forget()
-            self.hid_driver_row.pack(side="left", fill="x", expand=True, before=self.test_button)
-            self._refresh_hid_status()
-
-        hwnd = None
-        if is_post_message:
-            index = self.input_window_combo.current()
-            if index >= 0:
-                hwnd = self.input_windows[index].hwnd
-        self.input_controller.set_variant(variant, hwnd)
-        self._save_settings()
-
+    # --- HID (Human Interface Device) ---
     def _test_input_manager(self):
         try:
             self.input_controller.send_combo("WIN", [])
-            self._log(f"Test: sent 'Win' via {self.input_manager_var.get()}.")
+            self._log("Test: sent 'Win'.")
         except Exception as exc:
             self._log(f"Test failed: {exc}")
 
     # --- Interception-Treiber (Human Interface Device) ---
     def _refresh_hid_status(self):
         installed = interception_driver.is_installed()
-        self.hid_status_var.set(f"Driver: {'Installed' if installed else 'Not installed'}")
+        self.hid_status_var.set(f"HID Driver: {'Installed' if installed else 'Not installed'}")
         self.hid_driver_button.config(text="Uninstall" if installed else "Install")
 
     def _toggle_hid_driver(self):
@@ -718,30 +757,74 @@ class TriggerEditor(tk.Tk):
             # veralteten Zeitstempel) einen Timeout ausloest, bevor ueberhaupt ein neuer Biss
             # erkannt wurde.
             self.last_cast_at = None
+            self.lure_last_used_at = None
+            self.is_attacking = False
+            # Laufzeit dieses Start-Stop-Abschnitts in die Gesamtsumme einrechnen und
+            # persistieren - die Anzeige zaehlt ab jetzt nicht mehr weiter (siehe
+            # _update_runtime_display).
+            self.total_runtime_seconds += time.perf_counter() - self.session_started_at
+            self.session_started_at = None
+            self._set_runtime_var(self.total_runtime_seconds)
+            self._save_settings()
             return
 
         index = self.device_combo.current()
         speaker = resolve_speaker(index if index >= 0 else None)
         threshold = float(self.threshold_var.get())
-        cooldown = float(self.cooldown_var.get())
 
-        self.monitor = LiveMonitor(speaker, threshold, cooldown, self._handle_trigger)
+        self.monitor = LiveMonitor(speaker, threshold, COOLDOWN_SECONDS, self._handle_trigger)
         threading.Thread(target=self.monitor.run, daemon=True).start()
         self.monitor_button.config(text="Stop")
-        self._log(f"Started (threshold={threshold:.1f} dB, cooldown={cooldown:.1f}s).")
+        self._log(f"Started (threshold={threshold:.1f} dB).")
 
-        # last_cast_at bleibt bewusst None, bis der erste echte Biss erkannt und die
-        # WoW-Automation einmal durchgelaufen ist (siehe _run_wow_automation) - das
-        # Timeout-Sicherheitsnetz greift erst danach, nicht schon direkt nach Start.
-        self._check_wow_timeout()
+        # Es wird nicht auf den ersten echten Biss gewartet - last_cast_at wird so vorbelegt,
+        # dass die Timeout-Routine (siehe _check_angel_trigger_timeout) bereits nach
+        # ANGEL_TRIGGER_INITIAL_DELAY_SECONDS erstmals feuert, nicht erst nach dem vollen,
+        # in der Oberfläche eingestellten Timeout.
+        angel_timeout = float(self.angel_timeout_var.get())
+        self.last_cast_at = time.perf_counter() - (angel_timeout - ANGEL_TRIGGER_INITIAL_DELAY_SECONDS)
+        self._check_angel_trigger_timeout()
+
+        self.lure_last_used_at = time.perf_counter()
+        self._check_lure_timer()
+
+        self.session_started_at = time.perf_counter()
+        self._update_runtime_display()
+
+    def _set_runtime_var(self, total_seconds):
+        hours, remainder = divmod(int(total_seconds), 3600)
+        minutes = remainder // 60
+        self.runtime_var.set(f"Runtime: {hours}h {minutes:02d}m")
+
+    def _update_runtime_display(self):
+        if self.monitor is None:
+            return
+        elapsed = self.total_runtime_seconds + (time.perf_counter() - self.session_started_at)
+        self._set_runtime_var(elapsed)
+        self.after(1000, self._update_runtime_display)
+
+    def _reset_counters(self):
+        self.trigger_count = 0
+        self.total_runtime_seconds = 0.0
+        if self.monitor is not None:
+            self.session_started_at = time.perf_counter()
+        self.trigger_count_var.set("Triggers: 0")
+        self._set_runtime_var(0.0)
+        self._save_settings()
+        self._log("Trigger counter and runtime reset.")
+
+    def _on_close(self):
+        if self.monitor is not None:
+            self.total_runtime_seconds += time.perf_counter() - self.session_started_at
+            self._save_settings()
+        self.destroy()
 
     def _on_monitor_settings_changed(self):
-        # Threshold/Cooldown werden von LiveMonitor bei jedem Block frisch gelesen - laufende
-        # Erkennung muss dafür nicht neu gestartet werden.
+        # Threshold wird von LiveMonitor bei jedem Block frisch gelesen - laufende Erkennung
+        # muss dafür nicht neu gestartet werden.
         self._save_settings()
         if self.monitor is not None:
             self.monitor.threshold_db = float(self.threshold_var.get())
-            self.monitor.cooldown = float(self.cooldown_var.get())
 
     def _on_device_change(self):
         self._save_settings()
@@ -756,68 +839,122 @@ class TriggerEditor(tk.Tk):
 
     def _on_trigger_fired(self, db):
         self._log(f"Signal triggered ({db:.1f} dB)")
-        automation = self.automation_var.get()
-        if automation == AUTOMATION_DEFAULT:
-            self._send_default_signal()
-        elif automation == AUTOMATION_WOW:
-            threading.Thread(target=self._run_wow_automation, daemon=True).start()
-        else:
-            self._log(f"Automation '{automation}': not yet implemented.")
+        # Uhr sofort zuruecksetzen (nicht erst am Ende von _run_angel_trigger, das dauert bis
+        # zu ~3.5s) - sonst koennte _check_angel_trigger_timeout in der Zwischenzeit mit dem
+        # noch alten Zeitstempel erneut (faelschlich) ausloesen.
+        self.last_cast_at = time.perf_counter()
+        if self.is_attacking:
+            self.is_attacking = False
+            self._log("Threshold reached again - stopping attack loop.")
+        self.trigger_count += 1
+        self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
+        self._save_settings()
+        threading.Thread(target=self._run_angel_trigger, daemon=True).start()
 
-    def _run_wow_automation(self):
+    def _run_angel_trigger(self):
         # Läuft in einem eigenen Thread, damit die Wartezeiten (bis zu ~2.5s) nicht die
         # Tkinter-Oberfläche blockieren. Das eigentliche Senden + Loggen wird per self.after
         # auf den Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher).
-        time.sleep(random.uniform(*AUTOMATION_WOW_FIRST_DELAY_RANGE))
-        self.after(0, self._send_default_signal)
-        time.sleep(AUTOMATION_WOW_FIXED_DELAY)
-        time.sleep(random.uniform(*AUTOMATION_WOW_SECOND_DELAY_RANGE))
-        self.after(0, self._send_default_signal)
-        # Neuer Wurf beginnt jetzt - die Timeout-Uhr (siehe _check_wow_timeout) läuft ab hier
-        # wieder von vorne.
+        time.sleep(random.uniform(*ANGEL_TRIGGER_FIRST_DELAY_RANGE))
+        self.after(0, self._send_angel_signal)
+        time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
+        time.sleep(random.uniform(*ANGEL_TRIGGER_SECOND_DELAY_RANGE))
+        self.after(0, self._send_angel_signal)
+        # Neuer Wurf beginnt jetzt - die Timeout-Uhr (siehe _check_angel_trigger_timeout)
+        # läuft ab hier wieder von vorne.
         self.last_cast_at = time.perf_counter()
 
-    def _check_wow_timeout(self):
+    def _check_angel_trigger_timeout(self):
+        # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
+        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Während
+        # eines laufenden Angriffs (siehe _run_attack_loop) wird hier nichts geprüft - die
+        # Angriffsschleife übernimmt, bis wieder ein echter Biss erkannt wird.
+        if self.monitor is None:
+            return
+        if not self.is_attacking:
+            angel_timeout = float(self.angel_timeout_var.get())
+            if (
+                self.last_cast_at is not None
+                and time.perf_counter() - self.last_cast_at >= angel_timeout
+            ):
+                self.last_cast_at = time.perf_counter()
+                if self.attack_enabled_var.get():
+                    # Vermutlich durch einen Angriff unterbrochen - statt nur einmal zu
+                    # reagieren, wird jetzt wiederholt angegriffen (siehe _run_attack_loop),
+                    # bis wieder ein echter Biss (Threshold) erkannt wird (siehe
+                    # _on_trigger_fired).
+                    self._log(f"No bite within {angel_timeout:.0f}s - attacking.")
+                    self.is_attacking = True
+                    self._run_attack_loop()
+                else:
+                    # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt
+                    # wie ein Umschalter (fischt gerade -> wird abgebrochen, fischt nicht ->
+                    # wirft aus). Ein zweiter Druck kurz danach würde einen frisch
+                    # gestarteten Wurf sofort wieder abbrechen (Taste toggelt zurück in den
+                    # Ausgangszustand) - dann bleibt dauerhaft nichts ausgeworfen und der
+                    # Timeout feuert immer wieder ergebnislos. Mit nur einem Druck pro
+                    # Timeout pendelt sich der Zustand über die nächsten Zyklen von selbst
+                    # ein.
+                    self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+                    self._send_angel_signal()
+        self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
+
+    def _run_attack_loop(self):
+        if self.monitor is None or not self.is_attacking:
+            return
+        self._send_attack_signal()
+        self.after(int(ATTACK_TRIGGER_INTERVAL_SECONDS * 1000), self._run_attack_loop)
+
+    def _check_lure_timer(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
         # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
         if self.monitor is None:
             return
-        timeout = float(self.wow_timeout_var.get())
+        interval_minutes = float(self.lure_interval_var.get())
+        # 0 Minuten schaltet das Intervall ab - kein automatisches Senden.
         if (
-            self.automation_var.get() == AUTOMATION_WOW
-            and self.last_cast_at is not None
-            and time.perf_counter() - self.last_cast_at >= timeout
+            interval_minutes > 0
+            and self.lure_last_used_at is not None
+            and time.perf_counter() - self.lure_last_used_at >= interval_minutes * 60.0
         ):
-            # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
-            # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus). Ein
-            # zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort wieder
-            # abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt dauerhaft
-            # nichts ausgeworfen und der Timeout feuert immer wieder ergebnislos. Mit nur
-            # einem Druck pro Timeout pendelt sich der Zustand über die nächsten Zyklen von
-            # selbst ein.
-            self._log(f"No bite within {timeout:.0f}s - pressing signal once.")
-            self.last_cast_at = time.perf_counter()
-            self._send_default_signal()
-        self.after(AUTOMATION_WOW_TIMEOUT_CHECK_MS, self._check_wow_timeout)
+            self._log(f"Lure interval elapsed ({interval_minutes:.0f} min).")
+            self._send_lure_signal()
+        self.after(LURE_TIMER_CHECK_MS, self._check_lure_timer)
 
-    def _send_default_signal(self):
-        key = self.main_key_var.get()
+    def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var):
+        key = key_var.get()
         if not key:
             self._log("No signal configured.")
             return
         modifiers = [
             name for name, var in (
-                ("ctrl", self.mod_ctrl_var),
-                ("alt", self.mod_alt_var),
-                ("shift", self.mod_shift_var),
+                ("ctrl", mod_ctrl_var),
+                ("alt", mod_alt_var),
+                ("shift", mod_shift_var),
             ) if var.get()
         ]
         label = "+".join(m.capitalize() for m in modifiers + [key])
         try:
             self.input_controller.send_combo(key, modifiers)
-            self._log(f"Sent '{label}' via {self.input_manager_var.get()}.")
+            self._log(f"Sent '{label}'.")
         except Exception as exc:
             self._log(f"Send error: {exc}")
+
+    def _send_angel_signal(self):
+        self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var)
+
+    def _send_attack_signal(self):
+        self._send_signal(
+            self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var
+        )
+
+    def _send_lure_signal(self):
+        # Uhr zuruecksetzen, damit das naechste automatische Feuern wieder das volle
+        # Intervall ab jetzt abwartet.
+        self.lure_last_used_at = time.perf_counter()
+        self._send_signal(
+            self.lure_mod_ctrl_var, self.lure_mod_alt_var, self.lure_mod_shift_var, self.lure_main_key_var
+        )
 
     def _log(self, message):
         timestamp = time.strftime("%H:%M:%S")

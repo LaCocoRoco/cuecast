@@ -33,6 +33,25 @@ def compute_db(segment, sample_rate=SAMPLE_RATE):
     return 20 * np.log10(rms + _EPS)
 
 
+def compute_peak_db(segment, sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE):
+    """Lautester Block (gleiche Blockgröße wie die Live-Erkennung) innerhalb eines Segments.
+
+    Bewusst weder ein RMS-Mittel über das komplette (ggf. auch leise Ränder enthaltende)
+    Segment - das würde einen echten Treffer verwässern -, noch der absolute Sample-Peak -
+    der wäre anfällig für einen einzelnen Ausreißer. Die Blockgröße entspricht exakt der
+    Granularität, mit der LiveMonitor später vergleicht, ein einzelner Ausreißer geht in
+    einem ~23ms-Mittel unter.
+    """
+    if len(segment) < block_size:
+        return compute_db(segment, sample_rate)
+    best_db = -np.inf
+    for start in range(0, len(segment) - block_size + 1, block_size):
+        block_db = compute_db(segment[start:start + block_size], sample_rate)
+        if block_db > best_db:
+            best_db = block_db
+    return best_db
+
+
 class LiveMonitor:
     """Hört per Loopback auf ein Gerät und meldet einen Treffer, sobald die (hochpass-
     gefilterte) Lautstärke eines Blocks über dem Schwellwert (dBFS) liegt.
