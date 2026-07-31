@@ -2,8 +2,7 @@
 
 Audio-threshold-based trigger tool: listens to loopback audio, and reacts to loud events by
 sending configured key combinations (via the Interception HID driver). Originally built
-around a WoW fishing use case, hence the "Angel" (fishing rod) / "Lure" / "Attack"
-terminology.
+around a WoW fishing use case, hence the "Fishing" / "Lure" / "Attack" terminology.
 
 ## Audio detection
 
@@ -18,23 +17,29 @@ between them.
 ```
 Start
   -> short warm-up (5s, fixed) before the timeout routine engages
-  -> Angel Trigger: cast
+  -> Fishing Trigger: cast
 
 Threshold detected
-  -> wait 0-1s (randomized, feels more human than an instant reaction)
-  -> Angel Trigger: reel in
+  -> Fishing Trigger: reel in
   -> if Lure Delay > 0 and enough time has passed since the last Lure use:
+       -> fixed pause
        -> Lure Trigger: use lure
-       -> ignore the Threshold for 2s afterwards (the lure itself makes a splash
-          when it hits the water, which would otherwise immediately re-trigger
-          this whole sequence)
-  -> fixed pause (1s)
-  -> Angel Trigger: cast again
+       -> fixed pause (own delay, independent of the one above - the lure
+          itself takes a moment to actually land/apply)
+       -> ignore the Threshold for 2s from the moment the lure was used (it
+          makes a splash when it hits the water, which would otherwise
+          immediately re-trigger this whole sequence)
+  -> fixed pause
+  -> Fishing Trigger: cast again
 
 Timeout (no bite within the configured time)
-  -> Angel Trigger: cast (acts like a toggle - if still "fishing", this
+  -> Fishing Trigger: cast (acts like a toggle - if still "fishing", this
      interrupts it; the loop naturally recovers on the next cycle)
 ```
+
+Currently deliberately free of any randomized/humanized delays - those had led to
+inconsistent results, so the minimal reliable timings are being determined first; randomness
+can be reintroduced later once those are known.
 
 Attack Trigger runs completely independently of the above: as long as its own interval is
 set above 0, it just presses its configured key on that interval, the whole time monitoring
@@ -43,6 +48,6 @@ is active.
 ## Settings
 
 All key combinations (modifiers + main key), the Threshold, and the various timing values
-(Angel Timeout, Lure Delay, Attack Interval) are configurable in the UI and persisted in
+(Fishing Timeout, Lure Delay, Attack Interval) are configurable in the UI and persisted in
 `settings.json`, keyed per value - a value missing from a fresh `settings.json` simply falls
 back to its built-in default.

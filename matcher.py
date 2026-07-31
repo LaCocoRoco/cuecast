@@ -11,19 +11,19 @@ BLOCK_SIZE = 1024
 
 _EPS = 1e-9
 
-# Tiefe Frequenzen (z.B. Feuer-/Raumrauschen) ignorieren wir vor der Lautstärke-Messung -
-# laut Analyse liegen bei allen aufgezeichneten Splash-Sounds konsistent 30% der Energie
-# unterhalb von ~950-1090Hz.
+# We ignore low frequencies (e.g. fire/ambient room noise) before measuring loudness - per
+# analysis, all recorded splash sounds consistently have 30% of their energy below
+# ~950-1090Hz.
 HIGHPASS_CUTOFF_HZ = 900
 HIGHPASS_ORDER = 4
 
 
 def compute_db(segment, sample_rate=SAMPLE_RATE):
-    """Lautstärke (dBFS) eines Audio-Segments nach Hochpassfilterung.
+    """Loudness (dBFS) of an audio segment after high-pass filtering.
 
-    Gemeinsame Berechnung für die Live-Erkennung (LiveMonitor) und die dB-Anzeige einer
-    manuell markierten Auswahl im Trigger Editor, damit beide exakt denselben Wert für
-    dieselbe Aufnahme liefern.
+    Shared calculation for live detection (LiveMonitor) and the dB display of a manually
+    marked selection in the Trigger Editor, so both produce exactly the same value for the
+    same recording.
     """
     if len(segment) == 0:
         return -np.inf
@@ -34,13 +34,12 @@ def compute_db(segment, sample_rate=SAMPLE_RATE):
 
 
 def compute_peak_db(segment, sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE):
-    """Lautester Block (gleiche Blockgröße wie die Live-Erkennung) innerhalb eines Segments.
+    """Loudest block (same block size as live detection) within a segment.
 
-    Bewusst weder ein RMS-Mittel über das komplette (ggf. auch leise Ränder enthaltende)
-    Segment - das würde einen echten Treffer verwässern -, noch der absolute Sample-Peak -
-    der wäre anfällig für einen einzelnen Ausreißer. Die Blockgröße entspricht exakt der
-    Granularität, mit der LiveMonitor später vergleicht, ein einzelner Ausreißer geht in
-    einem ~23ms-Mittel unter.
+    Deliberately neither an RMS average over the whole (possibly quiet-edged) segment -
+    that would dilute a real hit - nor the absolute sample peak - that would be vulnerable to
+    a single outlier. The block size matches exactly the granularity LiveMonitor later
+    compares against, so a single outlier is averaged out within a ~23ms window.
     """
     if len(segment) < block_size:
         return compute_db(segment, sample_rate)
@@ -53,13 +52,13 @@ def compute_peak_db(segment, sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE):
 
 
 class LiveMonitor:
-    """Hört per Loopback auf ein Gerät und meldet einen Treffer, sobald die (hochpass-
-    gefilterte) Lautstärke eines Blocks über dem Schwellwert (dBFS) liegt.
+    """Listens to a device via loopback and reports a hit as soon as a block's (high-pass
+    filtered) loudness exceeds the threshold (dBFS).
 
-    Wir vergleichen bewusst nur die Lautstärke, nicht die exakte Signalform (kein Template-
-    Abgleich mehr): reale Splash-Aufnahmen unterscheiden sich in Timing/Tonhöhe/Verlauf zu
-    stark für zuverlässige Kreuzkorrelation, sind aber konsistent deutlich lauter als die
-    Stille/das Hintergrundrauschen dazwischen.
+    We deliberately only compare loudness, not the exact waveform shape (no more template
+    matching): real splash recordings vary too much in timing/pitch/shape for reliable
+    cross-correlation, but are consistently much louder than the silence/background noise
+    between them.
     """
 
     def __init__(self, speaker, threshold_db, cooldown, on_trigger,
@@ -76,11 +75,11 @@ class LiveMonitor:
         self.stop_event.set()
 
     def set_speaker(self, speaker):
-        # threshold_db/cooldown werden im Loop unten bei jedem Durchlauf frisch von self
-        # gelesen - dafür reicht ein einfaches Attribut-Update von außen. Das Aufnahmegerät
-        # steckt dagegen in einem bereits geöffneten Loopback-Recorder (siehe run()) und kann
-        # nicht einfach ausgetauscht werden - daher hier eine eigene Methode, die die äußere
-        # Schleife in run() zum Neuöffnen mit dem neuen Gerät veranlasst.
+        # threshold_db/cooldown are read fresh from self on every loop iteration below - a
+        # plain attribute update from outside is enough for those. The recording device, on
+        # the other hand, is tied to an already-open loopback recorder (see run()) and can't
+        # simply be swapped out - hence this dedicated method, which makes the outer loop in
+        # run() reopen with the new device.
         self.speaker = speaker
 
     def run(self):

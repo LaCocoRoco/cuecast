@@ -4,19 +4,19 @@ from interception.exceptions import DriverNotFoundError
 import interception_driver
 
 INSTALLER_HINT = (
-    "Interception-Treiber nicht installiert/aktiv. Installer liegt unter "
+    "Interception driver not installed/active. Installer is located at "
     r"Downloads\Interception-v1.0.1\command line installer\install-interception.exe "
-    "(als Administrator mit /install ausführen, danach neu starten)."
+    "(run as Administrator with /install, then reboot)."
 )
 
 REBOOT_HINT = (
-    "Interception-Treiber ist laut Registry installiert, aber (noch) nicht aktiv - "
-    "vermutlich fehlt der Neustart nach der Installation. Bitte Rechner neu starten."
+    "Interception driver is installed according to the registry, but not (yet) active - "
+    "a reboot after installation is probably missing. Please restart the computer."
 )
 
 
 class HidSender:
-    """Sendet eine Taste wie eine echte Tastatur - geht an das fokussierte Fenster."""
+    """Sends a key like a real keyboard - goes to the focused window."""
 
     def __init__(self):
         self._captured = False
@@ -44,11 +44,11 @@ class HidSender:
             except DriverNotFoundError as exc:
                 raise RuntimeError(INSTALLER_HINT) from exc
             except IndexError as exc:
-                # Bekannter Fehlerfall der interception-python-Bibliothek: findet sie keine
-                # echten Geräte (z.B. weil der Treiber zwar in der Registry als installiert
-                # eingetragen, aber mangels Neustart noch nicht aktiv geladen ist), läuft ihre
-                # Geräte-Erkennung über das intern nur teilweise befüllte Geräte-Array hinaus
-                # und wirft ein rohes IndexError statt eines aussagekräftigen Fehlers.
+                # Known failure mode of the interception-python library: if it finds no real
+                # devices (e.g. because the driver is registered in the registry but not yet
+                # actively loaded due to a missing reboot), its device detection runs past the
+                # internally only partially populated device array and raises a raw IndexError
+                # instead of a meaningful error.
                 if interception_driver.is_installed():
                     raise RuntimeError(REBOOT_HINT) from exc
                 raise RuntimeError(INSTALLER_HINT) from exc
@@ -56,7 +56,7 @@ class HidSender:
 
 
 class InputController:
-    """Sendet Tasten über den Interception-HID-Treiber, wie eine echte zweite Tastatur."""
+    """Sends keys via the Interception HID driver, like a real second keyboard."""
 
     def __init__(self):
         self.sender = HidSender()

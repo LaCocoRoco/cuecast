@@ -1,6 +1,6 @@
 from tkinter import ttk
 
-# Angelehnt an VS Code "Dark Modern", bewusst kein reines Schwarz.
+# Based on VS Code "Dark Modern", deliberately not pure black.
 BG = "#1f1f1f"
 BG_PANEL = "#2d2d2d"
 FG = "#cccccc"

@@ -1,4 +1,3 @@
-import random
 import threading
 import time
 import tkinter as tk
@@ -35,63 +34,65 @@ from theme import (
 
 PREVIEW_PATH = Path(__file__).parent / "_preview.wav"
 
-# Klicks (keine echte Auswahl) sind kürzer als das hier, in Sekunden. War vorher 0.08s -
-# das hat aber echte, kurze Markierungen (z.B. kurze Splash-Transienten < 80ms) fälschlich
-# als Klick statt als Auswahl behandelt. 0.03s ist ein Kompromiss zwischen beidem.
+# Clicks (not a real selection) are shorter than this, in seconds. Used to be 0.08s -
+# but that made real, short markings (e.g. short splash transients < 80ms) get wrongly
+# treated as a click instead of a selection. 0.03s is a compromise between the two.
 CLICK_EPSILON = 0.03
 PLAYHEAD_INTERVAL_MS = 30
 
-# Sicherheitspolster (fixe dB-Differenz, keine Prozentangabe - siehe compute_peak_db) unter
-# dem gemessenen Peak einer markierten Auswahl, wenn sie per Button als Threshold übernommen
-# wird.
+# Safety margin (fixed dB difference, not a percentage - see compute_peak_db) below the
+# measured peak of a marked selection, when it is applied as the Threshold via the button.
 THRESHOLD_SUGGESTION_MARGIN_DB = 3.0
 
-# Mindest-/Standardgröße des Fensters (Pixel). Muss mindestens so groß sein wie der
-# tatsächliche Platzbedarf der Steuerelemente (siehe winfo_reqwidth/reqheight).
+# Minimum/default window size (pixels). Must be at least as large as the controls'
+# actual space requirement (see winfo_reqwidth/reqheight).
 MIN_WIDTH = 700
 MIN_HEIGHT = 460
 
-# Einheitliche Breiten, damit Dropdowns bzw. Buttons in derselben Spalte gleich groß sind.
+# Uniform widths, so dropdowns/buttons in the same column are the same size.
 COMBO_WIDTH = 24
 BUTTON_WIDTH = 11
 
-# Einheitliche Zeilenhöhe für alle Steuerzeilen (nicht Terminal/Wellenform), damit nichts
-# je nach Zeileninhalt (Button vs. Entry vs. Checkbutton) leicht auf und ab springt.
+# Uniform row height for all control rows (not terminal/waveform), so nothing shifts up
+# and down slightly depending on row content (button vs. entry vs. checkbutton).
 ROW_HEIGHT = 33
 
-# Feste Höhe der Wellenform-Anzeige (Pixel) - ändert sich nicht mit der Fenstergröße.
+# Fixed height of the waveform display (pixels) - does not change with window size.
 WAVEFORM_HEIGHT = 100
 
 # ============================================================================
-# Angel-Trigger-Timing - bewusst alles hier an einer Stelle zum Feinjustieren im Code, nicht
-# über UI/Settings (siehe _run_angel_trigger/_check_angel_trigger_timeout für die Verwendung).
+# Fishing trigger timing - deliberately kept all in one place for fine-tuning in code,
+# not via UI/settings (see _run_fishing_trigger/_check_fishing_trigger_timeout for usage).
+# Currently deliberately without any randomized/human-like delay, to first determine the
+# minimal reliable timings (earlier randomized components led to inconsistent results) -
+# will be added back in later.
 # ============================================================================
-# Wartezeit (Sekunden, zufällig aus diesem Bereich) vor dem Fangen-Signal, nachdem ein Biss
-# erkannt wurde - wirkt menschlicher als eine exakte Reaktionszeit.
-ANGEL_TRIGGER_FIRST_DELAY_RANGE = (0.0, 1.0)
-# Feste Pause zwischen Fangen-Signal und erneutem Auswerfen. Keine zusätzliche variable
-# Wartezeit mehr danach - direkt nach dieser Pause wird erneut ausgeworfen.
-ANGEL_TRIGGER_FIXED_DELAY = 1
-# Timeout selbst ist über "Timeout (s)" in der Oberfläche einstellbar (self.angel_timeout_var).
-# Wie oft der Timeout geprüft wird - keine Zeitkonstante des Ablaufs selbst, muss i.d.R.
-# nicht angepasst werden.
-ANGEL_TRIGGER_TIMEOUT_CHECK_MS = 1000
-# Bei Start wird nicht auf den ersten echten Biss gewartet - die Routine läuft stattdessen
-# bereits nach dieser kurzen Anlaufzeit erstmals an (siehe _toggle_monitoring).
-ANGEL_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
+# Fixed pause between the catch signal and casting again.
+FISHING_TRIGGER_FIXED_DELAY = 2
+# The timeout itself is configurable via "Timeout (s)" in the UI
+# (self.fishing_timeout_var). How often the timeout is checked - not a timing constant of
+# the sequence itself, usually doesn't need to be adjusted.
+FISHING_TRIGGER_TIMEOUT_CHECK_MS = 1000
+# At Start, we don't wait for the first real bite - the routine instead runs for the
+# first time already after this short startup delay (see _toggle_monitoring).
+FISHING_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
 
-# Wie oft geprüft wird, ob das Attack-Intervall abgelaufen ist (siehe _check_attack_timer) -
-# keine Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
+# How often it's checked whether the Attack interval has elapsed (see _check_attack_timer) -
+# not a timing constant of the sequence itself, usually doesn't need to be adjusted.
 ATTACK_TIMER_CHECK_MS = 1000
 
-# Cooldown ist bewusst fix (keine UI/Settings) - Zeit zwischen zwei Live-Erkennungstreffern.
+# Cooldown is deliberately fixed (no UI/settings) - time between two live detection hits.
 COOLDOWN_SECONDS = 2.0
 
-# Der Lure selbst verursacht beim Auftreffen im Wasser ein Platsch-Geräusch, das den
-# Threshold erneut überschreitet - ohne diese Sperre würde das eine neue, überlappende
-# Angel-Trigger-Sequenz auslösen, während die durch den Lure ausgelöste noch läuft (siehe
+# Its own pause after the Lure signal, independent of FISHING_TRIGGER_FIXED_DELAY - the
+# lure itself also takes a moment until it's actually applied/landed.
+LURE_TRIGGER_FIXED_DELAY = 2.0
+
+# The lure itself causes a splash sound when it hits the water, which exceeds the
+# Threshold again - without this lockout, that would trigger a new, overlapping
+# fishing-trigger sequence while the one triggered by the lure is still running (see
 # _on_trigger_fired).
-LURE_SPLASH_IGNORE_SECONDS = 2.0
+LURE_SPLASH_IGNORE_SECONDS = 4.0
 
 
 class TriggerEditor(tk.Tk):
@@ -113,8 +114,8 @@ class TriggerEditor(tk.Tk):
         self.playhead_line = None
         self.is_playing = False
         self.is_paused = False
-        self.active_range = None  # (start_sample, end_sample) der laufenden Wiedergabe
-        self.paused_at = None  # Sekunden-Position bei Pause
+        self.active_range = None  # (start_sample, end_sample) of the current playback
+        self.paused_at = None  # position in seconds when paused
         self.playhead_job = None
         self.playback_started_at = None
         self.playback_offset = 0.0
@@ -123,18 +124,17 @@ class TriggerEditor(tk.Tk):
         self.monitor = None
         self.last_cast_at = None
         self.lure_last_used_at = None
-        # Nur gesetzt, wenn der Lure tatsaechlich gesendet wurde (im Gegensatz zu
-        # lure_last_used_at, das bei Start bereits vorbelegt wird) - dient ausschliesslich
-        # dazu, den eigenen Platsch-Ton des Lures nicht als neuen Biss zu werten (siehe
-        # _on_trigger_fired).
+        # Only set when the lure was actually sent (unlike lure_last_used_at, which is
+        # already pre-set at Start) - serves solely to avoid treating the lure's own splash
+        # sound as a new bite (see _on_trigger_fired).
         self.lure_fired_at = None
         self.attack_last_used_at = None
 
-        # Trigger-Zähler/Laufzeit: werden über settings.json persistiert (siehe
-        # _load_settings/_save_settings), Zurücksetzen nur explizit über den Reset-Button.
+        # Trigger counter/runtime: persisted via settings.json (see
+        # _load_settings/_save_settings), only reset explicitly via the Reset button.
         self.trigger_count = 0
         self.total_runtime_seconds = 0.0
-        self.session_started_at = None  # perf_counter()-Zeitpunkt des laufenden Start-Stop-Abschnitts
+        self.session_started_at = None  # perf_counter() timestamp of the current start-stop segment
 
         self.input_controller = InputController()
 
@@ -147,14 +147,14 @@ class TriggerEditor(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_widgets(self):
-        # Gerät/Snippets-Zeilen als gemeinsames Raster, damit Spalten
-        # (Auswahl, Play, Stop, Löschen, Umbenennen, ...) über die Zeilen hinweg fluchten.
+        # Device/snippets rows as a shared grid, so columns (selection, play, stop, delete,
+        # rename, ...) line up across the rows.
         controls = ttk.Frame(self)
         controls.pack(side="top", fill="x", padx=8, pady=8)
         for row in range(2):
             controls.grid_rowconfigure(row, minsize=ROW_HEIGHT)
 
-        # Zeile 0: Aufnahmegerät + Record/Stop
+        # Row 0: recording device + Record/Stop
         ttk.Label(controls, text="Device:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         device_names = [s.name for s in self.speakers]
         self.device_combo = ttk.Combobox(controls, values=device_names, state="readonly", width=COMBO_WIDTH)
@@ -165,9 +165,9 @@ class TriggerEditor(tk.Tk):
         self.record_button = ttk.Button(controls, text="Record", width=BUTTON_WIDTH, command=self._toggle_recording)
         self.record_button.grid(row=0, column=2, sticky="w", padx=4, pady=2)
 
-        # VB-CABLE (virtuelles Audiogerät für Rechner ohne echte Soundkarte): nur Status +
-        # Link zur offiziellen Download-Seite, damit der Treiber immer aktuell bleibt
-        # (siehe vbcable_driver.py) - kein gebündelter/lokal installierter Installer.
+        # VB-CABLE (virtual audio device for computers without a real sound card): just
+        # status + a link to the official download page, so the driver always stays current
+        # (see vbcable_driver.py) - no bundled/locally installed installer.
         ttk.Label(controls, text="VB-CABLE:").grid(row=0, column=3, sticky="w", padx=(16, 4), pady=2)
         self.vbcable_status_var = tk.StringVar(value="?")
         ttk.Label(controls, textvariable=self.vbcable_status_var).grid(row=0, column=4, sticky="w", padx=4, pady=2)
@@ -176,7 +176,7 @@ class TriggerEditor(tk.Tk):
         )
         self.vbcable_button.grid(row=0, column=5, sticky="w", padx=4, pady=2)
 
-        # Zeile 1: Snippet-Auswahl + Play/Stop/Löschen/Umbenennen/Speichern
+        # Row 1: snippet selection + Play/Stop/Delete/Rename/Save
         ttk.Label(controls, text="Snippets:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
         self.file_var = tk.StringVar()
         self.file_combo = ttk.Combobox(controls, textvariable=self.file_var, state="readonly", width=COMBO_WIDTH)
@@ -189,9 +189,9 @@ class TriggerEditor(tk.Tk):
         ttk.Button(controls, text="Delete", width=BUTTON_WIDTH, command=self._delete_snippet).grid(row=1, column=4, sticky="w", padx=4, pady=2)
         ttk.Button(controls, text="Rename", width=BUTTON_WIDTH, command=self._rename_snippet).grid(row=1, column=5, sticky="w", padx=4, pady=2)
 
-        # Wellenform: feste Größe (Breite = Grid-Breite, Höhe = WAVEFORM_HEIGHT), wächst/
-        # verschiebt sich nicht mit der Fenstergröße. Bewusst hier (direkt unter den
-        # Aufnahme-Zeilen), um es optisch von den generellen Einstellungen darunter zu trennen.
+        # Waveform: fixed size (width = grid width, height = WAVEFORM_HEIGHT), does not
+        # grow/shift with the window size. Deliberately placed here (directly below the
+        # recording rows) to visually separate it from the general settings below.
         self.figure = Figure(facecolor=BG)
         self.axes = self.figure.add_subplot(111)
         self._style_axes()
@@ -211,10 +211,10 @@ class TriggerEditor(tk.Tk):
             props=dict(alpha=0.3, facecolor=SELECTION_COLOR),
         )
 
-        # Button übernimmt den lautesten Block (gleiche Blockgröße wie die Live-Erkennung,
-        # siehe matcher.compute_peak_db) der per Maus gezogenen Auswahl minus Sicherheitspolster
-        # direkt als Threshold - nur aktiv, solange etwas markiert ist (siehe
-        # _update_selection_db). Info-Text dazu rechts neben dem Button.
+        # Button applies the loudest block (same block size as live detection, see
+        # matcher.compute_peak_db) of the mouse-dragged selection minus the safety margin
+        # directly as the Threshold - only active while something is selected (see
+        # _update_selection_db). Info text next to it, to the right of the button.
         selection_row = ttk.Frame(self)
         selection_row.pack(side="top", fill="x", padx=8)
         self.apply_threshold_button = ttk.Button(
@@ -224,8 +224,8 @@ class TriggerEditor(tk.Tk):
         self.selection_db_var = tk.StringVar(value="")
         ttk.Label(selection_row, textvariable=self.selection_db_var).pack(side="left", padx=(8, 0))
 
-        # HID (Interception-Treiber, geht immer an das fokussierte Fenster) - Status +
-        # Install/Uninstall + schneller manueller Test.
+        # HID (Interception driver, always goes to the focused window) - status +
+        # install/uninstall + a quick manual test.
         input_frame = ttk.Frame(self, height=ROW_HEIGHT)
         input_frame.pack_propagate(False)
         input_frame.pack(side="top", fill="x", padx=8, pady=4)
@@ -237,23 +237,23 @@ class TriggerEditor(tk.Tk):
         )
         self.hid_driver_button.pack(side="left", padx=4)
 
-        # Sendet die Windows-Taste (leicht sichtbar: öffnet/schließt das Startmenü), um HID
-        # unabhängig von den unten konfigurierten Signalen schnell zu testen.
+        # Sends the Windows key (easily visible: opens/closes the Start menu) to quickly
+        # test HID independently of the signals configured below.
         ttk.Button(input_frame, text="Test", width=BUTTON_WIDTH, command=self._test_input_manager).pack(
             side="left", padx=(16, 4)
         )
 
-        # Angel Trigger (Zeile 0) + Lure Trigger (Zeile 1): gemeinsames Grid, damit
-        # Checkbuttons/Dropdowns beider Zeilen exakt untereinander ausgerichtet sind (wie bei
-        # Device/Snippets oben).
+        # Fishing Trigger (row 0) + Lure Trigger (row 1): shared grid, so the checkbuttons/
+        # dropdowns of both rows line up exactly on top of each other (like Device/Snippets
+        # above).
         trigger_frame = ttk.Frame(self)
         trigger_frame.pack(side="top", fill="x", padx=8, pady=(0, 4))
         for row in range(3):
             trigger_frame.grid_rowconfigure(row, minsize=ROW_HEIGHT)
 
-        # Zeile 0: Angel Trigger - Signal, das bei einem erkannten Biss (Audio-Treffer)
-        # gesendet wird, siehe _run_angel_trigger. Timeout (s): siehe _check_angel_trigger_timeout.
-        ttk.Label(trigger_frame, text="Angel Trigger:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+        # Row 0: Fishing Trigger - signal sent when a bite (audio hit) is detected, see
+        # _run_fishing_trigger. Timeout (s): see _check_fishing_trigger_timeout.
+        ttk.Label(trigger_frame, text="Fishing Trigger:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         self.mod_ctrl_var = tk.BooleanVar(value=False)
         self.mod_alt_var = tk.BooleanVar(value=False)
         self.mod_shift_var = tk.BooleanVar(value=False)
@@ -269,19 +269,18 @@ class TriggerEditor(tk.Tk):
         self.main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Timeout (s):").grid(row=0, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.angel_timeout_var = tk.DoubleVar(value=24.0)
-        angel_timeout_spinbox = ttk.Spinbox(
-            trigger_frame, from_=5.0, to=60.0, increment=1.0, textvariable=self.angel_timeout_var, width=6
+        self.fishing_timeout_var = tk.DoubleVar(value=24.0)
+        fishing_timeout_spinbox = ttk.Spinbox(
+            trigger_frame, from_=5.0, to=60.0, increment=1.0, textvariable=self.fishing_timeout_var, width=6
         )
-        angel_timeout_spinbox.grid(row=0, column=6, sticky="w", padx=4, pady=2)
+        fishing_timeout_spinbox.grid(row=0, column=6, sticky="w", padx=4, pady=2)
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
-            angel_timeout_spinbox.bind(event, lambda e: self._save_settings())
+            fishing_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Zeile 1: Lure Trigger - gleicher Aufbau wie Angel Trigger, aber eigenes Signal, um
-        # den Köder aufzufrischen. Kein eigener Timer: wird nur verwendet, wenn ein echter
-        # Biss erkannt wurde UND seit der letzten Verwendung mindestens dieses Intervall
-        # (Sekunden) vergangen ist - dann zwischen Fangen- und Auswerfen-Signal (siehe
-        # _run_angel_trigger). 0 schaltet ab.
+        # Row 1: Lure Trigger - same layout as Fishing Trigger, but its own signal to
+        # refresh the lure. No timer of its own: only used when a real bite was detected AND
+        # at least this interval (seconds) has passed since the last use - then between the
+        # catch and cast signal (see _run_fishing_trigger). 0 disables it.
         ttk.Label(trigger_frame, text="Lure Trigger:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
         self.lure_mod_ctrl_var = tk.BooleanVar(value=False)
         self.lure_mod_alt_var = tk.BooleanVar(value=False)
@@ -306,9 +305,9 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             lure_interval_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Zeile 2: Attack Trigger - gleicher Aufbau wie Angel/Lure Trigger, genauso einfach wie
-        # Lure Trigger: läuft komplett unabhängig im eingestellten Intervall (siehe
-        # _check_attack_timer), solange die Erkennung aktiv ist. 0 schaltet ab.
+        # Row 2: Attack Trigger - same layout as Fishing/Lure Trigger, just as simple as
+        # Lure Trigger: runs completely independently on the configured interval (see
+        # _check_attack_timer), as long as detection is active. 0 disables it.
         ttk.Label(trigger_frame, text="Attack Trigger:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=2)
         self.attack_mod_ctrl_var = tk.BooleanVar(value=False)
         self.attack_mod_alt_var = tk.BooleanVar(value=False)
@@ -333,7 +332,7 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             attack_interval_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Live-Erkennung: Threshold/Start + Log
+        # Live detection: Threshold/Start + log
         monitor_frame = ttk.Frame(self, height=ROW_HEIGHT)
         monitor_frame.pack_propagate(False)
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
@@ -350,13 +349,13 @@ class TriggerEditor(tk.Tk):
         self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
         self.monitor_button.pack(side="left", padx=(16, 4))
 
-        # Trigger-Zähler + Laufzeit: über settings.json persistiert (self.trigger_count/
-        # self.total_runtime_seconds werden bereits in __init__ initialisiert/geladen).
+        # Trigger counter + runtime: persisted via settings.json (self.trigger_count/
+        # self.total_runtime_seconds are already initialized/loaded in __init__).
         self.trigger_count_var = tk.StringVar(value="Triggers: 0")
         ttk.Label(monitor_frame, textvariable=self.trigger_count_var).pack(side="left", padx=(16, 4))
 
-        # Laufzeit zählt nur, solange die Erkennung aktiv ist (Start gedrückt), pausiert bei
-        # Stop - siehe _update_runtime_display/_toggle_monitoring.
+        # Runtime only counts while detection is active (Start pressed), pauses on Stop -
+        # see _update_runtime_display/_toggle_monitoring.
         self.runtime_var = tk.StringVar(value="Runtime: 0h 00m")
         ttk.Label(monitor_frame, textvariable=self.runtime_var).pack(side="left", padx=(8, 4))
 
@@ -368,8 +367,8 @@ class TriggerEditor(tk.Tk):
             self, height=6, bg=BG_PANEL, fg=FG, insertbackground=FG,
             relief="flat", borderwidth=0, state="disabled", wrap="none",
         )
-        # Einziges Element mit expand=True - nimmt zusaetzliche Fensterhoehe beim
-        # Vergroessern auf, waehrend alle Zeilen darueber ihre feste Hoehe behalten.
+        # The only element with expand=True - absorbs extra window height when resizing
+        # larger, while all rows above it keep their fixed height.
         self.log_text.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
 
         self.update_idletasks()
@@ -388,7 +387,7 @@ class TriggerEditor(tk.Tk):
         self.axes.set_xticks([])
         self.axes.set_yticks([])
 
-    # --- Aufnahme ---
+    # --- Recording ---
     def _toggle_recording(self):
         if self.stop_event is not None:
             self.stop_event.set()
@@ -413,7 +412,7 @@ class TriggerEditor(tk.Tk):
         self.file_var.set(path.name)
         self._load_selected_file()
 
-    # --- Dateiliste ---
+    # --- File list ---
     def _refresh_file_list(self):
         SNIPPET_DIR.mkdir(exist_ok=True)
         files = sorted(p.name for p in SNIPPET_DIR.glob("*.wav"))
@@ -470,26 +469,26 @@ class TriggerEditor(tk.Tk):
         self._style_axes()
         self.marker_line = None
         self.playhead_line = None
-        # SpanSelector nutzt Blitting (eine gecachte Bildschirm-Kopie statt komplettem
-        # Neuzeichnen) - ohne diesen Reset bleibt eine alte Auswahl als visueller "Geist"
-        # sichtbar, obwohl self.selection bereits korrekt zurückgesetzt ist.
+        # SpanSelector uses blitting (a cached screen copy instead of a full redraw) -
+        # without this reset, an old selection stays visible as a "ghost", even though
+        # self.selection has already been reset correctly.
         self.span_selector.clear()
         if self.audio is not None:
             times = np.arange(len(self.audio)) / self.sample_rate
             self.axes.plot(times, self.audio, linewidth=0.5, color=WAVE_COLOR)
         self.canvas.draw_idle()
 
-    # --- Auswahl (Ziehen) ---
+    # --- Selection (drag) ---
     def _on_select(self, xmin, xmax):
-        # Eine neue Auswahl macht eine laufende/pausierte Wiedergabe ungültig - ohne
-        # diesen Reset würde ein späteres Play über _resume_playback() an der alten
-        # (jetzt falschen) Position weiterspielen statt an der neuen zu starten.
+        # A new selection invalidates any running/paused playback - without this reset, a
+        # later Play via _resume_playback() would continue at the old (now wrong) position
+        # instead of starting at the new one.
         self._stop_playback()
-        # Der SpanSelector kann (je nach Maus-Timing) auch für einen eigentlichen Klick
-        # eine winzige Spanne melden statt sie über minspan komplett zu verwerfen - das hier
-        # fängt das defensiv ab, damit es nicht zu einer entarteten Nulllängen-Auswahl kommt
-        # (die "Play" wirkungslos machen würde), egal ob _on_release oder _on_select zuerst
-        # verarbeitet wird.
+        # Depending on mouse timing, the SpanSelector can report a tiny span for an actual
+        # click instead of discarding it entirely via minspan - this defensively catches
+        # that, so it doesn't result in a degenerate zero-length selection (which would make
+        # "Play" ineffective), regardless of whether _on_release or _on_select is processed
+        # first.
         if abs(xmax - xmin) < CLICK_EPSILON:
             self.selection = None
             self.play_start = max(0.0, xmin)
@@ -499,7 +498,7 @@ class TriggerEditor(tk.Tk):
             self.play_start = None
         self._update_selection_db()
 
-    # --- Klick-Erkennung (unabhängig vom SpanSelector) ---
+    # --- Click detection (independent of the SpanSelector) ---
     def _on_press(self, event):
         if event.inaxes != self.axes or event.xdata is None:
             self._press_x = None
@@ -570,13 +569,13 @@ class TriggerEditor(tk.Tk):
             end_i = len(self.audio)
         return start_i, end_i
 
-    # --- Wiedergabe: gemeinsame Hilfsfunktion ---
+    # --- Playback: shared helper function ---
     def _write_preview_and_play(self, segment, rate):
         pcm16 = (np.clip(segment, -1.0, 1.0) * 32767).astype(np.int16)
         wavfile.write(PREVIEW_PATH, rate, pcm16)
         winsound.PlaySound(str(PREVIEW_PATH), winsound.SND_FILENAME | winsound.SND_ASYNC)
 
-    # --- Play/Pause/Stop für die geladene Aufnahme ---
+    # --- Play/Pause/Stop for the loaded recording ---
     def _toggle_play_pause(self):
         if self.audio is None:
             return
@@ -652,7 +651,7 @@ class TriggerEditor(tk.Tk):
         self.canvas.draw_idle()
         self.playhead_job = self.after(PLAYHEAD_INTERVAL_MS, self._update_playhead)
 
-    # --- Einstellungen (Geraet, Input Manager, Automation bleiben zwischen Starts erhalten) ---
+    # --- Settings (device, input manager, automation persist across restarts) ---
     def _load_settings(self):
         settings = load_settings()
 
@@ -668,8 +667,8 @@ class TriggerEditor(tk.Tk):
         main_key = settings.get("main_key")
         if main_key in keys.MAIN_KEYS:
             self.main_key_var.set(main_key)
-        if "angel_timeout_seconds" in settings:
-            self.angel_timeout_var.set(float(settings["angel_timeout_seconds"]))
+        if "fishing_timeout_seconds" in settings:
+            self.fishing_timeout_var.set(float(settings["fishing_timeout_seconds"]))
 
         self.lure_mod_ctrl_var.set(bool(settings.get("lure_mod_ctrl", False)))
         self.lure_mod_alt_var.set(bool(settings.get("lure_mod_alt", False)))
@@ -696,9 +695,9 @@ class TriggerEditor(tk.Tk):
 
     @staticmethod
     def _safe_float(var):
-        # Liest eine Spinbox-gebundene DoubleVar ab, ohne bei einem gerade leeren/ungueltigen
-        # Textfeld (z.B. waehrend der Nutzer darin tippt) mit TclError abzustuerzen - gibt in
-        # dem Fall None zurueck, der Aufrufer laesst den Wert dann einfach unveraendert/aus.
+        # Reads a spinbox-bound DoubleVar without crashing with a TclError if the text field
+        # is currently empty/invalid (e.g. while the user is typing in it) - returns None in
+        # that case, the caller then simply leaves the value unchanged/skips it.
         try:
             return float(var.get())
         except (ValueError, tk.TclError):
@@ -724,7 +723,7 @@ class TriggerEditor(tk.Tk):
         }
         for key, var in (
             ("threshold", self.threshold_var),
-            ("angel_timeout_seconds", self.angel_timeout_var),
+            ("fishing_timeout_seconds", self.fishing_timeout_var),
             ("lure_interval_seconds", self.lure_interval_var),
             ("attack_interval_seconds", self.attack_interval_var),
         ):
@@ -741,7 +740,7 @@ class TriggerEditor(tk.Tk):
         except Exception as exc:
             self._log(f"Test failed: {exc}")
 
-    # --- Interception-Treiber (Human Interface Device) ---
+    # --- Interception driver (Human Interface Device) ---
     def _refresh_hid_status(self):
         installed = interception_driver.is_installed()
         self.hid_status_var.set(f"HID Driver: {'Installed' if installed else 'Not installed'}")
@@ -770,7 +769,7 @@ class TriggerEditor(tk.Tk):
         self.hid_driver_button.config(state="normal")
         self._refresh_hid_status()
 
-    # --- VB-CABLE (virtuelles Audiogerät) ---
+    # --- VB-CABLE (virtual audio device) ---
     def _refresh_vbcable_status(self):
         installed = vbcable_driver.is_installed()
         self.vbcable_status_var.set("Installed" if installed else "Not installed")
@@ -779,23 +778,21 @@ class TriggerEditor(tk.Tk):
         vbcable_driver.open_download_page()
         self._log("Opened VB-CABLE download page in browser.")
 
-    # --- Live-Erkennung ---
+    # --- Live detection ---
     def _toggle_monitoring(self):
         if self.monitor is not None:
             self.monitor.stop()
             self.monitor = None
             self.monitor_button.config(text="Start")
             self._log("Stopped.")
-            # Uhr zuruecksetzen, damit ein spaeterer Start nicht sofort (mit einem laengst
-            # veralteten Zeitstempel) einen Timeout ausloest, bevor ueberhaupt ein neuer Biss
-            # erkannt wurde.
+            # Reset the clock, so a later Start doesn't immediately trigger a timeout (with
+            # a long-stale timestamp) before a new bite has even been detected.
             self.last_cast_at = None
             self.lure_last_used_at = None
             self.lure_fired_at = None
             self.attack_last_used_at = None
-            # Laufzeit dieses Start-Stop-Abschnitts in die Gesamtsumme einrechnen und
-            # persistieren - die Anzeige zaehlt ab jetzt nicht mehr weiter (siehe
-            # _update_runtime_display).
+            # Add this start-stop segment's runtime to the total and persist it - the
+            # display stops counting up from here (see _update_runtime_display).
             self.total_runtime_seconds += time.perf_counter() - self.session_started_at
             self.session_started_at = None
             self._set_runtime_var(self.total_runtime_seconds)
@@ -804,8 +801,8 @@ class TriggerEditor(tk.Tk):
 
         index = self.device_combo.current()
         speaker = resolve_speaker(index if index >= 0 else None)
-        # Faellt auf den Standardwert zurueck, falls das Feld gerade (z.B. mitten im Tippen)
-        # leer/ungueltig ist - soll "Start" nicht verhindern.
+        # Falls back to the default value if the field is currently (e.g. mid-typing)
+        # empty/invalid - should not prevent "Start".
         threshold = self._safe_float(self.threshold_var)
         if threshold is None:
             threshold = -40.0
@@ -815,19 +812,19 @@ class TriggerEditor(tk.Tk):
         self.monitor_button.config(text="Stop")
         self._log(f"Started (threshold={threshold:.1f} dB).")
 
-        # Es wird nicht auf den ersten echten Biss gewartet - last_cast_at wird so vorbelegt,
-        # dass die Timeout-Routine (siehe _check_angel_trigger_timeout) bereits nach
-        # ANGEL_TRIGGER_INITIAL_DELAY_SECONDS erstmals feuert, nicht erst nach dem vollen,
-        # in der Oberfläche eingestellten Timeout.
-        angel_timeout = self._safe_float(self.angel_timeout_var)
-        if angel_timeout is None:
-            angel_timeout = 24.0
-        self.last_cast_at = time.perf_counter() - (angel_timeout - ANGEL_TRIGGER_INITIAL_DELAY_SECONDS)
-        self._check_angel_trigger_timeout()
+        # We don't wait for the first real bite - last_cast_at is pre-set so that the
+        # timeout routine (see _check_fishing_trigger_timeout) fires for the first time
+        # already after FISHING_TRIGGER_INITIAL_DELAY_SECONDS, not only after the full
+        # timeout configured in the UI.
+        fishing_timeout = self._safe_float(self.fishing_timeout_var)
+        if fishing_timeout is None:
+            fishing_timeout = 24.0
+        self.last_cast_at = time.perf_counter() - (fishing_timeout - FISHING_TRIGGER_INITIAL_DELAY_SECONDS)
+        self._check_fishing_trigger_timeout()
 
-        # Kein eigener periodischer Timer mehr - Lure wird nur noch im Rahmen eines echten
-        # Bisses verwendet (siehe _on_trigger_fired/_run_angel_trigger), lure_last_used_at
-        # dient dort nur als Referenzzeitpunkt fuer "ist die Wartezeit abgelaufen".
+        # No more periodic timer of its own - the lure is now only used as part of a real
+        # bite (see _on_trigger_fired/_run_fishing_trigger), lure_last_used_at there only
+        # serves as the reference timestamp for "has the wait time elapsed".
         self.lure_last_used_at = time.perf_counter()
 
         self.attack_last_used_at = time.perf_counter()
@@ -865,8 +862,8 @@ class TriggerEditor(tk.Tk):
         self.destroy()
 
     def _on_monitor_settings_changed(self):
-        # Threshold wird von LiveMonitor bei jedem Block frisch gelesen - laufende Erkennung
-        # muss dafür nicht neu gestartet werden.
+        # Threshold is read fresh by LiveMonitor on every block - running detection doesn't
+        # need to be restarted for this.
         self._save_settings()
         if self.monitor is not None:
             self.monitor.threshold_db = float(self.threshold_var.get())
@@ -883,10 +880,10 @@ class TriggerEditor(tk.Tk):
         self.after(0, self._on_trigger_fired, db)
 
     def _on_trigger_fired(self, db):
-        # Der Lure selbst platscht beim Auftreffen im Wasser hoerbar auf und wuerde diesen
-        # Trigger sonst sofort wieder ausloesen, waehrend die durch ihn ausgeloeste Sequenz
-        # noch laeuft (siehe LURE_SPLASH_IGNORE_SECONDS) - das war die Ursache der
-        # ueberlappenden, durcheinandergewuerfelten Sende-Reihenfolge.
+        # The lure itself makes an audible splash when it hits the water and would
+        # otherwise immediately re-trigger this trigger, while the sequence it caused is
+        # still running (see LURE_SPLASH_IGNORE_SECONDS) - this was the cause of the
+        # overlapping, jumbled-up send order.
         if (
             self.lure_fired_at is not None
             and time.perf_counter() - self.lure_fired_at < LURE_SPLASH_IGNORE_SECONDS
@@ -894,20 +891,20 @@ class TriggerEditor(tk.Tk):
             self._log(f"Threshold detected: {db:.1f} dB (ignored, recent lure splash)")
             return
         self._log(f"Threshold detected: {db:.1f} dB")
-        # Uhr sofort zuruecksetzen (nicht erst am Ende von _run_angel_trigger, das dauert bis
-        # zu ~3.5s) - sonst koennte _check_angel_trigger_timeout in der Zwischenzeit mit dem
-        # noch alten Zeitstempel erneut (faelschlich) ausloesen.
+        # Reset the clock immediately (not only at the end of _run_fishing_trigger, which
+        # takes up to ~3.5s) - otherwise _check_fishing_trigger_timeout could incorrectly
+        # fire again in the meantime with the still-old timestamp.
         self.last_cast_at = time.perf_counter()
         self.trigger_count += 1
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
         self._save_settings()
-        # Entscheidung hier (Hauptthread) treffen, nicht erst im Hintergrund-Thread von
-        # _run_angel_trigger - Tk-Variablen (self.lure_interval_var) sollten nur vom
-        # Hauptthread aus gelesen werden. Absichtlich defensiv: ein ungueltiger/leerer
-        # Spinbox-Wert (z.B. waehrend der Nutzer gerade darin tippt) darf niemals den Angel
-        # Trigger selbst verhindern - schlimmstenfalls faellt nur die Lure-Nutzung diesmal aus.
+        # Make this decision here (main thread), not only in the background thread of
+        # _run_fishing_trigger - Tk variables (self.lure_interval_var) should only be read
+        # from the main thread. Deliberately defensive: an invalid/empty spinbox value (e.g.
+        # while the user is currently typing in it) must never prevent the Fishing Trigger
+        # itself - at worst, only the lure use is skipped this one time.
         use_lure = self._should_use_lure()
-        threading.Thread(target=self._run_angel_trigger, args=(use_lure,), daemon=True).start()
+        threading.Thread(target=self._run_fishing_trigger, args=(use_lure,), daemon=True).start()
 
     def _should_use_lure(self):
         try:
@@ -920,64 +917,63 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.lure_last_used_at >= lure_interval
         )
 
-    def _run_angel_trigger(self, use_lure):
-        # Läuft in einem eigenen Thread, damit die Wartezeiten nicht die Tkinter-Oberfläche
-        # blockieren. Das eigentliche Senden + Loggen wird per self.after auf den
-        # Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher). Ablauf: Fangen -> feste
-        # Pause -> (optional) Lure als eigene Zwischensequenz mit eigener fester Pause danach
-        # (der Lure selbst braucht auch kurz Zeit, bis er tatsächlich angewendet ist) ->
-        # erneutes Auswerfen. Keine variable Wartezeit vor dem erneuten Auswerfen mehr.
-        time.sleep(random.uniform(*ANGEL_TRIGGER_FIRST_DELAY_RANGE))
-        self.after(0, self._send_angel_signal)
-        time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
+    def _run_fishing_trigger(self, use_lure):
+        # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
+        # sending + logging is brought back to the main thread via self.after (Tkinter is not
+        # thread-safe). Sequence: catch -> fixed pause -> (optional) lure as its own
+        # in-between sequence with its own fixed pause afterwards (the lure itself also takes
+        # a moment until it's actually applied) -> cast again. Deliberately still without any
+        # randomized/human-like delay (see FISHING_TRIGGER_FIXED_DELAY) - first determine the
+        # minimal, reliable timings, randomized components get added back in afterwards.
+        self.after(0, self._send_fishing_signal)
+        time.sleep(FISHING_TRIGGER_FIXED_DELAY)
         if use_lure:
-            # Lure wird nach dem Fangen-Signal verwendet, muss also vor dem erneuten
-            # Auswerfen passieren (siehe _send_lure_signal, setzt lure_last_used_at zurueck,
-            # worauf _on_trigger_fired die LURE_SPLASH_IGNORE_SECONDS-Sperre stützt). Danach
-            # nochmal dieselbe feste Pause, damit der Lure selbst Zeit hat anzukommen, bevor
-            # es mit der normalen Sequenz weitergeht.
+            # The lure is used after the catch signal, so it must happen before casting
+            # again (see _send_lure_signal, resets lure_last_used_at, which
+            # _on_trigger_fired's LURE_SPLASH_IGNORE_SECONDS lockout relies on). Afterwards
+            # its own fixed pause (independent of FISHING_TRIGGER_FIXED_DELAY), so the lure
+            # itself has time to land before continuing with the normal sequence.
             self.after(0, self._send_lure_signal)
-            time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
-        self.after(0, self._send_angel_signal)
-        # Neuer Wurf beginnt jetzt - die Timeout-Uhr (siehe _check_angel_trigger_timeout)
-        # läuft ab hier wieder von vorne.
+            time.sleep(LURE_TRIGGER_FIXED_DELAY)
+        self.after(0, self._send_fishing_signal)
+        # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
+        # restarts from here.
         self.last_cast_at = time.perf_counter()
 
-    def _check_angel_trigger_timeout(self):
-        # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Das
-        # Neu-Einplanen steht bewusst in finally: ein ungueltiger/leerer Spinbox-Wert (z.B.
-        # waehrend der Nutzer gerade darin tippt) darf diese Kette niemals fuer den Rest der
-        # Sitzung abbrechen - sonst wuerde der Timeout dauerhaft nicht mehr geprueft.
+    def _check_fishing_trigger_timeout(self):
+        # Runs periodically on the Tk main thread, as long as detection is active (reschedules
+        # itself via self.after - no separate start/stop needed for this). The rescheduling is
+        # deliberately in finally: an invalid/empty spinbox value (e.g. while the user is
+        # currently typing in it) must never break this chain for the rest of the session -
+        # otherwise the timeout would never be checked again.
         if self.monitor is None:
             return
         try:
-            angel_timeout = float(self.angel_timeout_var.get())
+            fishing_timeout = float(self.fishing_timeout_var.get())
             if (
                 self.last_cast_at is not None
-                and time.perf_counter() - self.last_cast_at >= angel_timeout
+                and time.perf_counter() - self.last_cast_at >= fishing_timeout
             ):
-                # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie
-                # ein Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft
-                # aus). Ein zweiter Druck kurz danach würde einen frisch gestarteten Wurf
-                # sofort wieder abbrechen (Taste toggelt zurück in den Ausgangszustand) -
-                # dann bleibt dauerhaft nichts ausgeworfen und der Timeout feuert immer
-                # wieder ergebnislos. Mit nur einem Druck pro Timeout pendelt sich der
-                # Zustand über die nächsten Zyklen von selbst ein.
-                self._log(f"No bite within {angel_timeout:.0f}s.")
+                # Only ONE key press, no interrupt+recast: the key acts like a toggle
+                # (currently fishing -> gets interrupted, not fishing -> casts). A second
+                # press shortly after would immediately interrupt a freshly started cast
+                # again (key toggles back to the starting state) - then nothing stays cast
+                # and the timeout keeps firing without result. With just one press per
+                # timeout, the state settles itself out over the next cycles.
+                self._log(f"No bite within {fishing_timeout:.0f}s.")
                 self.last_cast_at = time.perf_counter()
-                self._send_angel_signal()
+                self._send_fishing_signal()
         except (ValueError, tk.TclError) as exc:
-            self._log(f"Angel trigger timeout check error: {exc}")
+            self._log(f"Fishing trigger timeout check error: {exc}")
         finally:
-            self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
+            self.after(FISHING_TRIGGER_TIMEOUT_CHECK_MS, self._check_fishing_trigger_timeout)
 
     def _check_attack_timer(self):
-        # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Bewusst
-        # simpel und komplett unabhängig vom Angel-Trigger-Timeout/Threshold - löst einfach im
-        # eingestellten Intervall aus. 0 schaltet ab. Neu-Einplanen steht bewusst in finally -
-        # siehe _check_angel_trigger_timeout fuer die Begruendung.
+        # Runs periodically on the Tk main thread, as long as detection is active (reschedules
+        # itself via self.after - no separate start/stop needed for this). Deliberately simple
+        # and completely independent of the Fishing-Trigger timeout/threshold - just fires on
+        # the configured interval. 0 disables it. Rescheduling is deliberately in finally -
+        # see _check_fishing_trigger_timeout for the reasoning.
         if self.monitor is None:
             return
         try:
@@ -1012,12 +1008,12 @@ class TriggerEditor(tk.Tk):
         except Exception as exc:
             self._log(f"Send error ({trigger_name}): {exc}")
 
-    def _send_angel_signal(self):
-        self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var, "Angel Trigger")
+    def _send_fishing_signal(self):
+        self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var, "Fishing Trigger")
 
     def _send_attack_signal(self):
-        # Uhr zuruecksetzen, damit das naechste automatische Feuern wieder das volle
-        # Intervall ab jetzt abwartet.
+        # Reset the clock, so the next automatic firing waits out the full interval again
+        # from now.
         self.attack_last_used_at = time.perf_counter()
         self._send_signal(
             self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var,
@@ -1025,9 +1021,9 @@ class TriggerEditor(tk.Tk):
         )
 
     def _send_lure_signal(self):
-        # Uhr zuruecksetzen, damit die naechste Verwendung wieder das volle Delay ab jetzt
-        # abwartet. lure_fired_at markiert zusaetzlich, dass der Lure JETZT tatsaechlich
-        # gesendet wurde - dient _on_trigger_fired dazu, den eigenen Platsch-Ton zu ignorieren.
+        # Reset the clock, so the next use waits out the full delay again from now.
+        # lure_fired_at additionally marks that the lure was actually sent JUST NOW - used by
+        # _on_trigger_fired to ignore its own splash sound.
         self.lure_last_used_at = time.perf_counter()
         self.lure_fired_at = time.perf_counter()
         self._send_signal(

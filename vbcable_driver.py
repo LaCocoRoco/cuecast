@@ -2,9 +2,9 @@ import webbrowser
 
 from audio_devices import list_speakers
 
-# Verlinkt bewusst nur auf die offizielle Download-Seite, statt den Installer selbst zu
-# bündeln - so bekommt man immer die aktuelle VB-CABLE-Version statt einer im Repo
-# einfrierenden Kopie.
+# Deliberately just links to the official download page instead of bundling the installer
+# itself - this way you always get the current VB-CABLE version instead of a copy that goes
+# stale in the repo.
 DOWNLOAD_PAGE_URL = "https://vb-audio.com/Cable/"
 
 

@@ -2,7 +2,7 @@ import soundcard as sc
 
 
 def list_speakers():
-    """Loopback-fähige Ausgabegeräte, indiziert in der Reihenfolge von soundcard."""
+    """Loopback-capable playback devices, indexed in soundcard's own order."""
     return list(sc.all_speakers())
 
 
@@ -13,5 +13,5 @@ def resolve_speaker(index=None):
 
 
 def loopback_microphone(speaker):
-    """Wandelt ein Ausgabegerät in sein Loopback-Aufnahmegerät um."""
+    """Turns a playback device into its loopback recording device."""
     return sc.get_microphone(id=str(speaker.name), include_loopback=True)
