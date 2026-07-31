@@ -85,6 +85,10 @@ ANGEL_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
 # Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
 LURE_TIMER_CHECK_MS = 1000
 
+# Wie oft geprüft wird, ob das Attack-Intervall abgelaufen ist (siehe _check_attack_timer) -
+# keine Zeitkonstante des Ablaufs selbst, muss i.d.R. nicht angepasst werden.
+ATTACK_TIMER_CHECK_MS = 1000
+
 # Cooldown ist bewusst fix (keine UI/Settings) - Zeit zwischen zwei Live-Erkennungstreffern.
 COOLDOWN_SECONDS = 2.0
 
@@ -118,7 +122,7 @@ class TriggerEditor(tk.Tk):
         self.monitor = None
         self.last_cast_at = None
         self.lure_last_used_at = None
-        self.is_attacking = False
+        self.attack_last_used_at = None
 
         # Trigger-Zähler/Laufzeit: werden über settings.json persistiert (siehe
         # _load_settings/_save_settings), Zurücksetzen nur explizit über den Reset-Button.
@@ -294,11 +298,9 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             lure_interval_spinbox.bind(event, lambda e: self._save_settings())
 
-        # Zeile 2: Attack Trigger - gleicher Aufbau wie Angel/Lure Trigger. Ist Intervall (s)
-        # > 0, wird dieses Signal beim Angel-Trigger-Timeout (siehe
-        # _check_angel_trigger_timeout) zuerst gesendet, bevor die Angel erneut ausgeworfen
-        # wird (z.B. um einen aus dem Wasser gesprungenen Gegner zuerst zu bekämpfen), danach
-        # wiederholt im eingestellten Intervall (siehe _run_attack_loop). 0 schaltet ab.
+        # Zeile 2: Attack Trigger - gleicher Aufbau wie Angel/Lure Trigger, genauso einfach wie
+        # Lure Trigger: läuft komplett unabhängig im eingestellten Intervall (siehe
+        # _check_attack_timer), solange die Erkennung aktiv ist. 0 schaltet ab.
         ttk.Label(trigger_frame, text="Attack Trigger:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=2)
         self.attack_mod_ctrl_var = tk.BooleanVar(value=False)
         self.attack_mod_alt_var = tk.BooleanVar(value=False)
@@ -358,7 +360,9 @@ class TriggerEditor(tk.Tk):
             self, height=6, bg=BG_PANEL, fg=FG, insertbackground=FG,
             relief="flat", borderwidth=0, state="disabled", wrap="none",
         )
-        self.log_text.pack(side="top", fill="x", padx=8, pady=(0, 8))
+        # Einziges Element mit expand=True - nimmt zusaetzliche Fensterhoehe beim
+        # Vergroessern auf, waehrend alle Zeilen darueber ihre feste Hoehe behalten.
+        self.log_text.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
 
         self.update_idletasks()
         grid_width = max(
@@ -763,7 +767,7 @@ class TriggerEditor(tk.Tk):
             # erkannt wurde.
             self.last_cast_at = None
             self.lure_last_used_at = None
-            self.is_attacking = False
+            self.attack_last_used_at = None
             # Laufzeit dieses Start-Stop-Abschnitts in die Gesamtsumme einrechnen und
             # persistieren - die Anzeige zaehlt ab jetzt nicht mehr weiter (siehe
             # _update_runtime_display).
@@ -792,6 +796,9 @@ class TriggerEditor(tk.Tk):
 
         self.lure_last_used_at = time.perf_counter()
         self._check_lure_timer()
+
+        self.attack_last_used_at = time.perf_counter()
+        self._check_attack_timer()
 
         self.session_started_at = time.perf_counter()
         self._update_runtime_display()
@@ -848,9 +855,6 @@ class TriggerEditor(tk.Tk):
         # zu ~3.5s) - sonst koennte _check_angel_trigger_timeout in der Zwischenzeit mit dem
         # noch alten Zeitstempel erneut (faelschlich) ausloesen.
         self.last_cast_at = time.perf_counter()
-        if self.is_attacking:
-            self.is_attacking = False
-            self._log("Threshold reached again - stopping attack loop.")
         self.trigger_count += 1
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
         self._save_settings()
@@ -871,10 +875,7 @@ class TriggerEditor(tk.Tk):
 
     def _check_angel_trigger_timeout(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Läuft
-        # unabhängig von einem laufenden Angriff (siehe _run_attack_loop) weiter - die Angel
-        # muss ja weiter (wiederholt) ausgeworfen werden, damit überhaupt wieder ein Biss
-        # erkannt werden kann, der die Angriffsschleife stoppt (siehe _on_trigger_fired).
+        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
         if self.monitor is None:
             return
         angel_timeout = float(self.angel_timeout_var.get())
@@ -882,7 +883,6 @@ class TriggerEditor(tk.Tk):
             self.last_cast_at is not None
             and time.perf_counter() - self.last_cast_at >= angel_timeout
         ):
-            self.last_cast_at = time.perf_counter()
             # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
             # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus). Ein
             # zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort wieder
@@ -891,26 +891,25 @@ class TriggerEditor(tk.Tk):
             # einem Druck pro Timeout pendelt sich der Zustand über die nächsten Zyklen von
             # selbst ein.
             self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+            self.last_cast_at = time.perf_counter()
             self._send_angel_signal()
-            if float(self.attack_interval_var.get()) > 0 and not self.is_attacking:
-                # Angriffsschleife nur beim ersten Mal starten (siehe _run_attack_loop) -
-                # läuft danach unabhängig weiter, bis wieder ein echter Biss (Threshold)
-                # erkannt wird. 0 schaltet ab.
-                self._log("Starting attack loop.")
-                self.is_attacking = True
-                self._run_attack_loop()
         self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
 
-    def _run_attack_loop(self):
-        if self.monitor is None or not self.is_attacking:
+    def _check_attack_timer(self):
+        # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
+        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Bewusst
+        # simpel und komplett unabhängig vom Angel-Trigger-Timeout/Threshold - löst einfach im
+        # eingestellten Intervall aus, wie Lure Trigger (siehe _check_lure_timer). 0 schaltet ab.
+        if self.monitor is None:
             return
         interval_seconds = float(self.attack_interval_var.get())
-        if interval_seconds <= 0:
-            # Wurde waehrend eines laufenden Angriffs auf 0 gestellt - Schleife abbrechen.
-            self.is_attacking = False
-            return
-        self._send_attack_signal()
-        self.after(int(interval_seconds * 1000), self._run_attack_loop)
+        if (
+            interval_seconds > 0
+            and self.attack_last_used_at is not None
+            and time.perf_counter() - self.attack_last_used_at >= interval_seconds
+        ):
+            self._send_attack_signal()
+        self.after(ATTACK_TIMER_CHECK_MS, self._check_attack_timer)
 
     def _check_lure_timer(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
@@ -951,6 +950,9 @@ class TriggerEditor(tk.Tk):
         self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var)
 
     def _send_attack_signal(self):
+        # Uhr zuruecksetzen, damit das naechste automatische Feuern wieder das volle
+        # Intervall ab jetzt abwartet.
+        self.attack_last_used_at = time.perf_counter()
         self._send_signal(
             self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var
         )
