@@ -259,7 +259,7 @@ class TriggerEditor(tk.Tk):
         self.main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Timeout (s):").grid(row=0, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.angel_timeout_var = tk.DoubleVar(value=22.0)
+        self.angel_timeout_var = tk.DoubleVar(value=24.0)
         angel_timeout_spinbox = ttk.Spinbox(
             trigger_frame, from_=5.0, to=60.0, increment=1.0, textvariable=self.angel_timeout_var, width=6
         )
@@ -288,7 +288,7 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Intervall (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.lure_interval_var = tk.DoubleVar(value=600.0)
+        self.lure_interval_var = tk.DoubleVar(value=0.0)
         lure_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
         )
@@ -315,7 +315,7 @@ class TriggerEditor(tk.Tk):
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Intervall (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.attack_interval_var = tk.DoubleVar(value=2.0)
+        self.attack_interval_var = tk.DoubleVar(value=0.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
@@ -684,28 +684,44 @@ class TriggerEditor(tk.Tk):
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
         self._set_runtime_var(self.total_runtime_seconds)
 
+    @staticmethod
+    def _safe_float(var):
+        # Liest eine Spinbox-gebundene DoubleVar ab, ohne bei einem gerade leeren/ungueltigen
+        # Textfeld (z.B. waehrend der Nutzer darin tippt) mit TclError abzustuerzen - gibt in
+        # dem Fall None zurueck, der Aufrufer laesst den Wert dann einfach unveraendert/aus.
+        try:
+            return float(var.get())
+        except (ValueError, tk.TclError):
+            return None
+
     def _save_settings(self):
-        save_settings({
+        settings = {
             "device": self.device_combo.get(),
-            "threshold": self.threshold_var.get(),
             "mod_ctrl": self.mod_ctrl_var.get(),
             "mod_alt": self.mod_alt_var.get(),
             "mod_shift": self.mod_shift_var.get(),
             "main_key": self.main_key_var.get(),
-            "angel_timeout_seconds": self.angel_timeout_var.get(),
             "lure_mod_ctrl": self.lure_mod_ctrl_var.get(),
             "lure_mod_alt": self.lure_mod_alt_var.get(),
             "lure_mod_shift": self.lure_mod_shift_var.get(),
             "lure_main_key": self.lure_main_key_var.get(),
-            "lure_interval_seconds": self.lure_interval_var.get(),
             "attack_mod_ctrl": self.attack_mod_ctrl_var.get(),
             "attack_mod_alt": self.attack_mod_alt_var.get(),
             "attack_mod_shift": self.attack_mod_shift_var.get(),
             "attack_main_key": self.attack_main_key_var.get(),
-            "attack_interval_seconds": self.attack_interval_var.get(),
             "trigger_count": self.trigger_count,
             "total_runtime_seconds": self.total_runtime_seconds,
-        })
+        }
+        for key, var in (
+            ("threshold", self.threshold_var),
+            ("angel_timeout_seconds", self.angel_timeout_var),
+            ("lure_interval_seconds", self.lure_interval_var),
+            ("attack_interval_seconds", self.attack_interval_var),
+        ):
+            value = self._safe_float(var)
+            if value is not None:
+                settings[key] = value
+        save_settings(settings)
 
     # --- HID (Human Interface Device) ---
     def _test_input_manager(self):
@@ -777,7 +793,11 @@ class TriggerEditor(tk.Tk):
 
         index = self.device_combo.current()
         speaker = resolve_speaker(index if index >= 0 else None)
-        threshold = float(self.threshold_var.get())
+        # Faellt auf den Standardwert zurueck, falls das Feld gerade (z.B. mitten im Tippen)
+        # leer/ungueltig ist - soll "Start" nicht verhindern.
+        threshold = self._safe_float(self.threshold_var)
+        if threshold is None:
+            threshold = -40.0
 
         self.monitor = LiveMonitor(speaker, threshold, COOLDOWN_SECONDS, self._handle_trigger)
         threading.Thread(target=self.monitor.run, daemon=True).start()
@@ -788,7 +808,9 @@ class TriggerEditor(tk.Tk):
         # dass die Timeout-Routine (siehe _check_angel_trigger_timeout) bereits nach
         # ANGEL_TRIGGER_INITIAL_DELAY_SECONDS erstmals feuert, nicht erst nach dem vollen,
         # in der Oberfläche eingestellten Timeout.
-        angel_timeout = float(self.angel_timeout_var.get())
+        angel_timeout = self._safe_float(self.angel_timeout_var)
+        if angel_timeout is None:
+            angel_timeout = 24.0
         self.last_cast_at = time.perf_counter() - (angel_timeout - ANGEL_TRIGGER_INITIAL_DELAY_SECONDS)
         self._check_angel_trigger_timeout()
 
@@ -860,14 +882,22 @@ class TriggerEditor(tk.Tk):
         self._save_settings()
         # Entscheidung hier (Hauptthread) treffen, nicht erst im Hintergrund-Thread von
         # _run_angel_trigger - Tk-Variablen (self.lure_interval_var) sollten nur vom
-        # Hauptthread aus gelesen werden.
-        lure_interval = float(self.lure_interval_var.get())
-        use_lure = (
+        # Hauptthread aus gelesen werden. Absichtlich defensiv: ein ungueltiger/leerer
+        # Spinbox-Wert (z.B. waehrend der Nutzer gerade darin tippt) darf niemals den Angel
+        # Trigger selbst verhindern - schlimmstenfalls faellt nur die Lure-Nutzung diesmal aus.
+        use_lure = self._should_use_lure()
+        threading.Thread(target=self._run_angel_trigger, args=(use_lure,), daemon=True).start()
+
+    def _should_use_lure(self):
+        try:
+            lure_interval = float(self.lure_interval_var.get())
+        except (ValueError, tk.TclError):
+            return False
+        return (
             lure_interval > 0
             and self.lure_last_used_at is not None
             and time.perf_counter() - self.lure_last_used_at >= lure_interval
         )
-        threading.Thread(target=self._run_angel_trigger, args=(use_lure,), daemon=True).start()
 
     def _run_angel_trigger(self, use_lure):
         # Läuft in einem eigenen Thread, damit die Wartezeiten (bis zu ~2.5s) nicht die
@@ -889,41 +919,53 @@ class TriggerEditor(tk.Tk):
 
     def _check_angel_trigger_timeout(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
-        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig).
+        # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Das
+        # Neu-Einplanen steht bewusst in finally: ein ungueltiger/leerer Spinbox-Wert (z.B.
+        # waehrend der Nutzer gerade darin tippt) darf diese Kette niemals fuer den Rest der
+        # Sitzung abbrechen - sonst wuerde der Timeout dauerhaft nicht mehr geprueft.
         if self.monitor is None:
             return
-        angel_timeout = float(self.angel_timeout_var.get())
-        if (
-            self.last_cast_at is not None
-            and time.perf_counter() - self.last_cast_at >= angel_timeout
-        ):
-            # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie ein
-            # Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft aus). Ein
-            # zweiter Druck kurz danach würde einen frisch gestarteten Wurf sofort wieder
-            # abbrechen (Taste toggelt zurück in den Ausgangszustand) - dann bleibt dauerhaft
-            # nichts ausgeworfen und der Timeout feuert immer wieder ergebnislos. Mit nur
-            # einem Druck pro Timeout pendelt sich der Zustand über die nächsten Zyklen von
-            # selbst ein.
-            self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
-            self.last_cast_at = time.perf_counter()
-            self._send_angel_signal()
-        self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
+        try:
+            angel_timeout = float(self.angel_timeout_var.get())
+            if (
+                self.last_cast_at is not None
+                and time.perf_counter() - self.last_cast_at >= angel_timeout
+            ):
+                # Nur EIN Tastendruck, kein Unterbrechen+Neuauswerfen: die Taste wirkt wie
+                # ein Umschalter (fischt gerade -> wird abgebrochen, fischt nicht -> wirft
+                # aus). Ein zweiter Druck kurz danach würde einen frisch gestarteten Wurf
+                # sofort wieder abbrechen (Taste toggelt zurück in den Ausgangszustand) -
+                # dann bleibt dauerhaft nichts ausgeworfen und der Timeout feuert immer
+                # wieder ergebnislos. Mit nur einem Druck pro Timeout pendelt sich der
+                # Zustand über die nächsten Zyklen von selbst ein.
+                self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+                self.last_cast_at = time.perf_counter()
+                self._send_angel_signal()
+        except (ValueError, tk.TclError) as exc:
+            self._log(f"Angel trigger timeout check error: {exc}")
+        finally:
+            self.after(ANGEL_TRIGGER_TIMEOUT_CHECK_MS, self._check_angel_trigger_timeout)
 
     def _check_attack_timer(self):
         # Läuft periodisch auf dem Tk-Hauptthread, solange die Erkennung aktiv ist (plant
         # sich selbst per self.after neu ein - kein separater Start/Stop dafür nötig). Bewusst
         # simpel und komplett unabhängig vom Angel-Trigger-Timeout/Threshold - löst einfach im
-        # eingestellten Intervall aus. 0 schaltet ab.
+        # eingestellten Intervall aus. 0 schaltet ab. Neu-Einplanen steht bewusst in finally -
+        # siehe _check_angel_trigger_timeout fuer die Begruendung.
         if self.monitor is None:
             return
-        interval_seconds = float(self.attack_interval_var.get())
-        if (
-            interval_seconds > 0
-            and self.attack_last_used_at is not None
-            and time.perf_counter() - self.attack_last_used_at >= interval_seconds
-        ):
-            self._send_attack_signal()
-        self.after(ATTACK_TIMER_CHECK_MS, self._check_attack_timer)
+        try:
+            interval_seconds = float(self.attack_interval_var.get())
+            if (
+                interval_seconds > 0
+                and self.attack_last_used_at is not None
+                and time.perf_counter() - self.attack_last_used_at >= interval_seconds
+            ):
+                self._send_attack_signal()
+        except (ValueError, tk.TclError) as exc:
+            self._log(f"Attack timer check error: {exc}")
+        finally:
+            self.after(ATTACK_TIMER_CHECK_MS, self._check_attack_timer)
 
     def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var):
         key = key_var.get()
