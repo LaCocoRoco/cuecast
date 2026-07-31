@@ -1,3 +1,4 @@
+import random
 import threading
 import time
 import tkinter as tk
@@ -30,6 +31,7 @@ from theme import (
     SELECTION_COLOR,
     WAVE_COLOR,
     apply_dark_theme,
+    bind_tooltip,
 )
 
 PREVIEW_PATH = Path(__file__).parent / "_preview.wav"
@@ -63,20 +65,24 @@ WAVEFORM_HEIGHT = 100
 # ============================================================================
 # Fishing trigger timing - the actual values are user-adjustable via the "Timing" dialog
 # (see _open_timing_dialog) and persisted in settings.json; these are just the defaults for
-# a fresh settings.json (see _build_widgets for where the Tk variables are created).
-# Currently deliberately without any randomized/human-like delay, to first determine the
-# minimal reliable timings (earlier randomized components led to inconsistent results) -
-# will be added back in later.
+# a fresh settings.json (see __init__ for where the Tk variables are created).
+# Fishing Delay/Start Delay/Lure Delay each have a companion "range" value (also in the
+# Timing dialog): 0 (the default) keeps the delay fixed at exactly the base value, as
+# before; a nonzero range instead picks a random delay somewhere between the base value and
+# the range value (see _resolve_randomized_delay) - a simple way to make the timing less
+# uniform/predictable without giving up the option of a precise fixed delay.
 # ============================================================================
 # Fixed pause between the catch signal and casting again.
-FISHING_TRIGGER_FIXED_DELAY_DEFAULT = 2.0
+FISHING_DELAY_DEFAULT = 2.0
+FISHING_DELAY_RANGE_DEFAULT = 0.0
 # The timeout itself is configurable via "Timeout (s)" in the UI
 # (self.fishing_timeout_var). How often the timeout is checked - not a timing constant of
 # the sequence itself, usually doesn't need to be adjusted.
 FISHING_TRIGGER_TIMEOUT_CHECK_MS = 1000
 # At Start, we don't wait for the first real bite - the routine instead runs for the
 # first time already after this short startup delay (see _toggle_monitoring).
-FISHING_TRIGGER_INITIAL_DELAY_DEFAULT = 5.0
+START_DELAY_DEFAULT = 5.0
+START_DELAY_RANGE_DEFAULT = 0.0
 
 # How often it's checked whether the Attack interval has elapsed (see _check_attack_timer) -
 # not a timing constant of the sequence itself, usually doesn't need to be adjusted.
@@ -85,9 +91,10 @@ ATTACK_TIMER_CHECK_MS = 1000
 # Time between two live detection hits.
 COOLDOWN_DEFAULT = 2.0
 
-# Its own pause after the Lure signal, independent of the fishing fixed delay - the lure
-# itself also takes a moment until it's actually applied/landed.
-LURE_TRIGGER_FIXED_DELAY_DEFAULT = 2.0
+# Its own pause after the Lure signal, independent of the fishing delay - the lure itself
+# also takes a moment until it's actually applied/landed.
+LURE_DELAY_DEFAULT = 2.0
+LURE_DELAY_RANGE_DEFAULT = 0.0
 
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
@@ -95,8 +102,18 @@ LURE_TRIGGER_FIXED_DELAY_DEFAULT = 2.0
 # _on_trigger_fired).
 LURE_SPLASH_IGNORE_DEFAULT = 4.0
 
+# Failsafe: if the Threshold is misconfigured (e.g. set too sensitive) or something else
+# keeps feeding it loud audio, real detections could otherwise fire the Fishing Trigger in
+# an unbounded loop. If it fires this many times within one fishing-timeout window, we stop
+# reacting to detections entirely until the timeout itself elapses and sends its own single
+# recovery press (see _on_trigger_fired/_check_fishing_trigger_timeout, which also clears
+# this state again) - after that, normal detection resumes and could trip the failsafe again
+# if the same problem persists.
+FAILSAFE_TRIGGER_COUNT_DEFAULT = 4.0
+
 # Spinbox range/step shared by all timing fields in the "Timing" dialog.
 TIMING_DIALOG_SPINBOX_RANGE = (0.0, 60.0, 0.5)
+TIMING_DIALOG_COUNT_RANGE = (2.0, 20.0, 1.0)
 
 
 class TriggerEditor(tk.Tk):
@@ -134,13 +151,26 @@ class TriggerEditor(tk.Tk):
         self.lure_fired_at = None
         self.attack_last_used_at = None
 
+        # Failsafe state (see _on_trigger_fired/_check_fishing_trigger_timeout):
+        # threshold_trigger_times holds the perf_counter() timestamps of recent real
+        # detections that were actually allowed to fire, so we can tell whether there were
+        # too many of them within one fishing-timeout window.
+        self.threshold_trigger_times = []
+        self.failsafe_active = False
+
         # Timing values adjustable via the "Timing" dialog (see _open_timing_dialog),
-        # persisted in settings.json just like the other trigger settings.
-        self.fishing_fixed_delay_var = tk.DoubleVar(value=FISHING_TRIGGER_FIXED_DELAY_DEFAULT)
-        self.fishing_initial_delay_var = tk.DoubleVar(value=FISHING_TRIGGER_INITIAL_DELAY_DEFAULT)
-        self.lure_fixed_delay_var = tk.DoubleVar(value=LURE_TRIGGER_FIXED_DELAY_DEFAULT)
+        # persisted in settings.json just like the other trigger settings. Fishing/Start/
+        # Lure Delay each have a companion "range" var - 0 keeps the delay fixed at the base
+        # value (as before), a nonzero range randomizes it (see _resolve_randomized_delay).
+        self.fishing_delay_var = tk.DoubleVar(value=FISHING_DELAY_DEFAULT)
+        self.fishing_delay_range_var = tk.DoubleVar(value=FISHING_DELAY_RANGE_DEFAULT)
+        self.start_delay_var = tk.DoubleVar(value=START_DELAY_DEFAULT)
+        self.start_delay_range_var = tk.DoubleVar(value=START_DELAY_RANGE_DEFAULT)
+        self.lure_delay_var = tk.DoubleVar(value=LURE_DELAY_DEFAULT)
+        self.lure_delay_range_var = tk.DoubleVar(value=LURE_DELAY_RANGE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
+        self.failsafe_trigger_count_var = tk.DoubleVar(value=FAILSAFE_TRIGGER_COUNT_DEFAULT)
         self.timing_dialog = None
 
         # Trigger counter/runtime: persisted via settings.json (see
@@ -155,6 +185,7 @@ class TriggerEditor(tk.Tk):
         self._build_widgets()
         self._load_settings()
         self._refresh_file_list()
+        self._update_snippet_view_visibility()
         self._refresh_hid_status()
         self._refresh_vbcable_status()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -210,6 +241,7 @@ class TriggerEditor(tk.Tk):
         self._style_axes()
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
         canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget = canvas_widget
         canvas_widget.pack(side="top", anchor="w", padx=8, pady=8)
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("button_release_event", self._on_release)
@@ -229,6 +261,7 @@ class TriggerEditor(tk.Tk):
         # directly as the Threshold - only active while something is selected (see
         # _update_selection_db). Info text next to it, to the right of the button.
         selection_row = ttk.Frame(self)
+        self.selection_row = selection_row
         selection_row.pack(side="top", fill="x", padx=8)
         self.apply_threshold_button = ttk.Button(
             selection_row, text="Apply as Threshold", command=self._apply_selection_as_threshold, state="disabled"
@@ -240,6 +273,7 @@ class TriggerEditor(tk.Tk):
         # HID (Interception driver, always goes to the focused window) - status +
         # install/uninstall + a quick manual test.
         input_frame = ttk.Frame(self, height=ROW_HEIGHT)
+        self.input_frame = input_frame
         input_frame.pack_propagate(False)
         input_frame.pack(side="top", fill="x", padx=8, pady=4)
 
@@ -290,6 +324,10 @@ class TriggerEditor(tk.Tk):
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             fishing_timeout_spinbox.bind(event, lambda e: self._save_settings())
 
+        fishing_info_label = ttk.Label(trigger_frame, text="ⓘ", cursor="hand2")
+        fishing_info_label.grid(row=0, column=7, sticky="w", padx=(8, 0), pady=2)
+        bind_tooltip(fishing_info_label, "Install the 'Better Fishing' addon.")
+
         # Row 1: Lure Trigger - same layout as Fishing Trigger, but its own signal to
         # refresh the lure. No timer of its own: only used when a real bite was detected AND
         # at least this interval (seconds) has passed since the last use - then between the
@@ -336,12 +374,22 @@ class TriggerEditor(tk.Tk):
         self.attack_main_key_combo.grid(row=2, column=4, sticky="w", padx=4, pady=2)
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Intervall (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
+        ttk.Label(trigger_frame, text="Interval (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
         self.attack_interval_var = tk.DoubleVar(value=0.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
         attack_interval_spinbox.grid(row=2, column=6, sticky="w", padx=4, pady=2)
+
+        attack_info_label = ttk.Label(trigger_frame, text="ⓘ", cursor="hand2")
+        attack_info_label.grid(row=2, column=7, sticky="w", padx=(8, 0), pady=2)
+        bind_tooltip(
+            attack_info_label,
+            "Gameplay > Combat > Enable Action Targeting\n\n"
+            "Enables a targeting system that dynamically targets enemies based on where "
+            "you're looking. Bind the Attack Trigger to an ability that requires a target - "
+            "otherwise it will interrupt fishing.",
+        )
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             attack_interval_spinbox.bind(event, lambda e: self._save_settings())
 
@@ -368,12 +416,12 @@ class TriggerEditor(tk.Tk):
 
         # Trigger counter + runtime: persisted via settings.json (self.trigger_count/
         # self.total_runtime_seconds are already initialized/loaded in __init__).
-        self.trigger_count_var = tk.StringVar(value="Triggers: 0")
+        self.trigger_count_var = tk.StringVar(value="Trigger: 0")
         ttk.Label(monitor_frame, textvariable=self.trigger_count_var).pack(side="left", padx=(16, 4))
 
         # Runtime only counts while detection is active (Start pressed), pauses on Stop -
         # see _update_runtime_display/_toggle_monitoring.
-        self.runtime_var = tk.StringVar(value="Runtime: 0h 00m")
+        self.runtime_var = tk.StringVar(value="Time: 0h 00m")
         ttk.Label(monitor_frame, textvariable=self.runtime_var).pack(side="left", padx=(8, 4))
 
         ttk.Button(monitor_frame, text="Reset", width=BUTTON_WIDTH, command=self._reset_counters).pack(
@@ -450,6 +498,22 @@ class TriggerEditor(tk.Tk):
         self.play_start = None
         self._update_selection_db()
         self._redraw()
+        self._update_snippet_view_visibility()
+
+    def _update_snippet_view_visibility(self):
+        # Hides the waveform and the "Apply as Threshold" row entirely while no snippet is
+        # loaded (none ever recorded yet, or all deleted) - saves screen space that would
+        # otherwise sit empty/unused most of the time. Re-packed with before=self.input_frame
+        # so they land back in their original spot instead of at the end of the pack order.
+        has_snippet = bool(self.file_var.get())
+        if has_snippet:
+            if not self.canvas_widget.winfo_ismapped():
+                self.canvas_widget.pack(side="top", anchor="w", padx=8, pady=8, before=self.input_frame)
+            if not self.selection_row.winfo_ismapped():
+                self.selection_row.pack(side="top", fill="x", padx=8, before=self.input_frame)
+        else:
+            self.canvas_widget.pack_forget()
+            self.selection_row.pack_forget()
 
     def _delete_snippet(self):
         name = self.file_var.get()
@@ -466,6 +530,7 @@ class TriggerEditor(tk.Tk):
             self.play_start = None
             self._update_selection_db()
             self._redraw()
+            self._update_snippet_view_visibility()
 
     def _rename_snippet(self):
         old_name = self.file_var.get()
@@ -705,20 +770,28 @@ class TriggerEditor(tk.Tk):
         if "attack_interval_seconds" in settings:
             self.attack_interval_var.set(float(settings["attack_interval_seconds"]))
 
-        if "fishing_fixed_delay_seconds" in settings:
-            self.fishing_fixed_delay_var.set(float(settings["fishing_fixed_delay_seconds"]))
-        if "fishing_initial_delay_seconds" in settings:
-            self.fishing_initial_delay_var.set(float(settings["fishing_initial_delay_seconds"]))
-        if "lure_fixed_delay_seconds" in settings:
-            self.lure_fixed_delay_var.set(float(settings["lure_fixed_delay_seconds"]))
+        if "fishing_delay_seconds" in settings:
+            self.fishing_delay_var.set(float(settings["fishing_delay_seconds"]))
+        if "fishing_delay_range_seconds" in settings:
+            self.fishing_delay_range_var.set(float(settings["fishing_delay_range_seconds"]))
+        if "start_delay_seconds" in settings:
+            self.start_delay_var.set(float(settings["start_delay_seconds"]))
+        if "start_delay_range_seconds" in settings:
+            self.start_delay_range_var.set(float(settings["start_delay_range_seconds"]))
+        if "lure_delay_seconds" in settings:
+            self.lure_delay_var.set(float(settings["lure_delay_seconds"]))
+        if "lure_delay_range_seconds" in settings:
+            self.lure_delay_range_var.set(float(settings["lure_delay_range_seconds"]))
         if "lure_splash_ignore_seconds" in settings:
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
             self.cooldown_var.set(float(settings["cooldown_seconds"]))
+        if "failsafe_trigger_count" in settings:
+            self.failsafe_trigger_count_var.set(float(settings["failsafe_trigger_count"]))
 
         self.trigger_count = int(settings.get("trigger_count", 0))
         self.total_runtime_seconds = float(settings.get("total_runtime_seconds", 0.0))
-        self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
+        self.trigger_count_var.set(f"Trigger: {self.trigger_count}")
         self._set_runtime_var(self.total_runtime_seconds)
 
     @staticmethod
@@ -730,6 +803,22 @@ class TriggerEditor(tk.Tk):
             return float(var.get())
         except (ValueError, tk.TclError):
             return None
+
+    def _resolve_randomized_delay(self, base_var, base_default, range_var):
+        # base_var/range_var (both read here, on the main thread only) form the Fishing/
+        # Start/Lure Delay + range pair from the "Timing" dialog. A range of 0 (the default)
+        # keeps the delay fixed at exactly the base value, unchanged from before this
+        # feature existed. A nonzero range instead picks a random delay somewhere between
+        # the base value and the range value - whichever of the two is smaller/larger
+        # doesn't matter, it's sorted below.
+        base = self._safe_float(base_var)
+        if base is None:
+            base = base_default
+        range_value = self._safe_float(range_var)
+        if not range_value:
+            return base
+        low, high = sorted((base, range_value))
+        return random.uniform(low, high)
 
     def _save_settings(self):
         settings = {
@@ -754,11 +843,15 @@ class TriggerEditor(tk.Tk):
             ("fishing_timeout_seconds", self.fishing_timeout_var),
             ("lure_interval_seconds", self.lure_interval_var),
             ("attack_interval_seconds", self.attack_interval_var),
-            ("fishing_fixed_delay_seconds", self.fishing_fixed_delay_var),
-            ("fishing_initial_delay_seconds", self.fishing_initial_delay_var),
-            ("lure_fixed_delay_seconds", self.lure_fixed_delay_var),
+            ("fishing_delay_seconds", self.fishing_delay_var),
+            ("fishing_delay_range_seconds", self.fishing_delay_range_var),
+            ("start_delay_seconds", self.start_delay_var),
+            ("start_delay_range_seconds", self.start_delay_range_var),
+            ("lure_delay_seconds", self.lure_delay_var),
+            ("lure_delay_range_seconds", self.lure_delay_range_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
+            ("failsafe_trigger_count", self.failsafe_trigger_count_var),
         ):
             value = self._safe_float(var)
             if value is not None:
@@ -824,6 +917,8 @@ class TriggerEditor(tk.Tk):
             self.lure_last_used_at = None
             self.lure_fired_at = None
             self.attack_last_used_at = None
+            self.failsafe_active = False
+            self.threshold_trigger_times = []
             # Add this start-stop segment's runtime to the total and persist it - the
             # display stops counting up from here (see _update_runtime_display).
             self.total_runtime_seconds += time.perf_counter() - self.session_started_at
@@ -850,15 +945,15 @@ class TriggerEditor(tk.Tk):
 
         # We don't wait for the first real bite - last_cast_at is pre-set so that the
         # timeout routine (see _check_fishing_trigger_timeout) fires for the first time
-        # already after the Fishing Initial Delay (see the "Timing" dialog), not only after
-        # the full timeout configured in the UI.
+        # already after the Start Delay (see the "Timing" dialog), not only after the full
+        # timeout configured in the UI.
         fishing_timeout = self._safe_float(self.fishing_timeout_var)
         if fishing_timeout is None:
             fishing_timeout = 24.0
-        initial_delay = self._safe_float(self.fishing_initial_delay_var)
-        if initial_delay is None:
-            initial_delay = FISHING_TRIGGER_INITIAL_DELAY_DEFAULT
-        self.last_cast_at = time.perf_counter() - (fishing_timeout - initial_delay)
+        start_delay = self._resolve_randomized_delay(
+            self.start_delay_var, START_DELAY_DEFAULT, self.start_delay_range_var
+        )
+        self.last_cast_at = time.perf_counter() - (fishing_timeout - start_delay)
         self._check_fishing_trigger_timeout()
 
         # No more periodic timer of its own - the lure is now only used as part of a real
@@ -875,7 +970,7 @@ class TriggerEditor(tk.Tk):
     def _set_runtime_var(self, total_seconds):
         hours, remainder = divmod(int(total_seconds), 3600)
         minutes = remainder // 60
-        self.runtime_var.set(f"Runtime: {hours}h {minutes:02d}m")
+        self.runtime_var.set(f"Time: {hours}h {minutes:02d}m")
 
     def _update_runtime_display(self):
         if self.monitor is None:
@@ -889,7 +984,7 @@ class TriggerEditor(tk.Tk):
         self.total_runtime_seconds = 0.0
         if self.monitor is not None:
             self.session_started_at = time.perf_counter()
-        self.trigger_count_var.set("Triggers: 0")
+        self.trigger_count_var.set("Trigger: 0")
         self._set_runtime_var(0.0)
         self._save_settings()
         self._log("Trigger counter and runtime reset.")
@@ -919,20 +1014,40 @@ class TriggerEditor(tk.Tk):
         frame = ttk.Frame(dialog)
         frame.pack(padx=12, pady=12)
 
-        from_, to, increment = TIMING_DIALOG_SPINBOX_RANGE
+        # Fishing/Start/Lure Delay each get a companion "range" field (see
+        # _resolve_randomized_delay): 0 keeps the delay fixed at the base value, a nonzero
+        # value randomizes it somewhere between the two fields.
         fields = (
-            ("Fishing Fixed Delay (s):", self.fishing_fixed_delay_var),
-            ("Fishing Initial Delay (s):", self.fishing_initial_delay_var),
-            ("Lure Fixed Delay (s):", self.lure_fixed_delay_var),
-            ("Lure Splash Ignore (s):", self.lure_splash_ignore_var),
-            ("Cooldown (s):", self.cooldown_var),
+            ("Fishing Delay (s):", self.fishing_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.fishing_delay_range_var),
+            ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.start_delay_range_var),
+            ("Lure Delay (s):", self.lure_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.lure_delay_range_var),
+            ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
+            ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
+            ("Failsafe Trigger Count:", self.failsafe_trigger_count_var, TIMING_DIALOG_COUNT_RANGE, None),
         )
-        for row, (label, var) in enumerate(fields):
+        for row, (label, var, (from_, to, increment), range_var) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
             spinbox = ttk.Spinbox(frame, from_=from_, to=to, increment=increment, textvariable=var, width=6)
             spinbox.grid(row=row, column=1, sticky="w", pady=4)
             for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
                 spinbox.bind(event, lambda e: self._on_timing_settings_changed())
+
+            if range_var is not None:
+                range_spinbox = ttk.Spinbox(
+                    frame, from_=0.0, to=to, increment=increment, textvariable=range_var, width=6
+                )
+                range_spinbox.grid(row=row, column=2, sticky="w", padx=(4, 0), pady=4)
+                for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+                    range_spinbox.bind(event, lambda e: self._on_timing_settings_changed())
+
+        info_label = ttk.Label(frame, text="ⓘ", cursor="hand2")
+        info_label.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=4)
+        bind_tooltip(
+            info_label,
+            "The second field next to Fishing/Start/Lure Delay is a range: leave it at 0 "
+            "for a fixed delay (the first field), or enter a value to pick a random delay "
+            "between the two fields each time - which field is larger doesn't matter.",
+        )
 
     def _on_timing_settings_changed(self):
         self._save_settings()
@@ -979,13 +1094,36 @@ class TriggerEditor(tk.Tk):
         ):
             self._log(f"Threshold detected: {db:.1f} dB (ignored, recent lure splash)")
             return
+
+        # Failsafe: while active, ignore real detections entirely and leave last_cast_at
+        # alone, so the independent timeout check (_check_fishing_trigger_timeout) is the
+        # only thing that can still fire - once it does, it clears this state again.
+        if self.failsafe_active:
+            self._log(f"Threshold detected: {db:.1f} dB (ignored, failsafe active)")
+            return
+
+        now = time.perf_counter()
+        fishing_timeout = self._safe_float(self.fishing_timeout_var)
+        if fishing_timeout is None:
+            fishing_timeout = 24.0
+        self.threshold_trigger_times = [t for t in self.threshold_trigger_times if now - t < fishing_timeout]
+        self.threshold_trigger_times.append(now)
+
+        failsafe_count = self._safe_float(self.failsafe_trigger_count_var)
+        if failsafe_count is None:
+            failsafe_count = FAILSAFE_TRIGGER_COUNT_DEFAULT
+        if len(self.threshold_trigger_times) >= failsafe_count:
+            self._log("Too many Threshold triggers in a short time - waiting for timeout.")
+            self.failsafe_active = True
+            return
+
         self._log(f"Threshold detected: {db:.1f} dB")
         # Reset the clock immediately (not only at the end of _run_fishing_trigger, which
         # takes up to ~3.5s) - otherwise _check_fishing_trigger_timeout could incorrectly
         # fire again in the meantime with the still-old timestamp.
         self.last_cast_at = time.perf_counter()
         self.trigger_count += 1
-        self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
+        self.trigger_count_var.set(f"Trigger: {self.trigger_count}")
         self._save_settings()
         # Make these decisions/reads here (main thread), not only in the background thread of
         # _run_fishing_trigger - Tk variables should only be read from the main thread.
@@ -994,14 +1132,14 @@ class TriggerEditor(tk.Tk):
         # only the lure use is skipped this one time, and the timing values fall back to
         # their coded defaults.
         use_lure = self._should_use_lure()
-        fixed_delay = self._safe_float(self.fishing_fixed_delay_var)
-        if fixed_delay is None:
-            fixed_delay = FISHING_TRIGGER_FIXED_DELAY_DEFAULT
-        lure_fixed_delay = self._safe_float(self.lure_fixed_delay_var)
-        if lure_fixed_delay is None:
-            lure_fixed_delay = LURE_TRIGGER_FIXED_DELAY_DEFAULT
+        fishing_delay = self._resolve_randomized_delay(
+            self.fishing_delay_var, FISHING_DELAY_DEFAULT, self.fishing_delay_range_var
+        )
+        lure_delay = self._resolve_randomized_delay(
+            self.lure_delay_var, LURE_DELAY_DEFAULT, self.lure_delay_range_var
+        )
         threading.Thread(
-            target=self._run_fishing_trigger, args=(use_lure, fixed_delay, lure_fixed_delay), daemon=True
+            target=self._run_fishing_trigger, args=(use_lure, fishing_delay, lure_delay), daemon=True
         ).start()
 
     def _should_use_lure(self):
@@ -1015,27 +1153,26 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.lure_last_used_at >= lure_interval
         )
 
-    def _run_fishing_trigger(self, use_lure, fixed_delay, lure_fixed_delay):
+    def _run_fishing_trigger(self, use_lure, fishing_delay, lure_delay):
         # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
         # sending + logging is brought back to the main thread via self.after (Tkinter is not
-        # thread-safe). Sequence: catch -> fixed pause -> (optional) lure as its own
-        # in-between sequence with its own fixed pause afterwards (the lure itself also takes
-        # a moment until it's actually applied) -> cast again. Deliberately still without any
-        # randomized/human-like delay - first determine the minimal, reliable timings,
-        # randomized components get added back in afterwards. fixed_delay/lure_fixed_delay
-        # are read from the "Timing" dialog's Tk variables on the main thread by the caller
-        # (_on_trigger_fired) and passed in here as plain values, since Tk variables must not
-        # be read from a background thread.
+        # thread-safe). Sequence: catch -> Fishing Delay -> (optional) lure as its own
+        # in-between sequence with its own Lure Delay afterwards (the lure itself also takes
+        # a moment until it's actually applied) -> cast again. fishing_delay/lure_delay are
+        # resolved from the "Timing" dialog's Tk variables (base value, or a randomized value
+        # within a configured range - see _resolve_randomized_delay) on the main thread by
+        # the caller (_on_trigger_fired) and passed in here as plain values, since Tk
+        # variables must not be read from a background thread.
         self.after(0, self._send_fishing_signal)
-        time.sleep(fixed_delay)
+        time.sleep(fishing_delay)
         if use_lure:
             # The lure is used after the catch signal, so it must happen before casting
             # again (see _send_lure_signal, resets lure_last_used_at, which
             # _on_trigger_fired's lure-splash-ignore lockout relies on). Afterwards its own
-            # fixed pause (independent of fixed_delay), so the lure itself has time to land
+            # delay (independent of fishing_delay), so the lure itself has time to land
             # before continuing with the normal sequence.
             self.after(0, self._send_lure_signal)
-            time.sleep(lure_fixed_delay)
+            time.sleep(lure_delay)
         self.after(0, self._send_fishing_signal)
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
@@ -1063,6 +1200,10 @@ class TriggerEditor(tk.Tk):
                 # timeout, the state settles itself out over the next cycles.
                 self._log(f"No bite within {fishing_timeout:.0f}s.")
                 self.last_cast_at = time.perf_counter()
+                # The timeout elapsing is also the recovery point for the failsafe (see
+                # _on_trigger_fired) - clear it so normal detection resumes from here.
+                self.failsafe_active = False
+                self.threshold_trigger_times = []
                 self._send_fishing_signal()
         except (ValueError, tk.TclError) as exc:
             self._log(f"Fishing trigger timeout check error: {exc}")

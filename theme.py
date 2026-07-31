@@ -1,3 +1,4 @@
+import tkinter as tk
 from tkinter import ttk
 
 # Based on VS Code "Dark Modern", deliberately not pure black.
@@ -32,3 +33,35 @@ def apply_dark_theme(root):
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
     root.option_add("*TCombobox*Listbox.selectForeground", FG)
+
+
+def bind_tooltip(widget, text):
+    """Shows a small dark-themed popup with `text` below `widget` on hover.
+
+    ttk has no built-in tooltip widget, so this is a borderless Toplevel shown/hidden via
+    <Enter>/<Leave>, positioned just below the widget it's bound to.
+    """
+    state = {"window": None}
+
+    def show(event=None):
+        if state["window"] is not None:
+            return
+        x = widget.winfo_rootx()
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        window = tk.Toplevel(widget)
+        window.wm_overrideredirect(True)
+        window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            window, text=text, justify="left", background=BG_PANEL, foreground=FG,
+            relief="solid", borderwidth=1, wraplength=320, padx=6, pady=4,
+        )
+        label.pack()
+        state["window"] = window
+
+    def hide(event=None):
+        if state["window"] is not None:
+            state["window"].destroy()
+            state["window"] = None
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
