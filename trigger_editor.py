@@ -61,38 +61,42 @@ ROW_HEIGHT = 33
 WAVEFORM_HEIGHT = 100
 
 # ============================================================================
-# Fishing trigger timing - deliberately kept all in one place for fine-tuning in code,
-# not via UI/settings (see _run_fishing_trigger/_check_fishing_trigger_timeout for usage).
+# Fishing trigger timing - the actual values are user-adjustable via the "Timing" dialog
+# (see _open_timing_dialog) and persisted in settings.json; these are just the defaults for
+# a fresh settings.json (see _build_widgets for where the Tk variables are created).
 # Currently deliberately without any randomized/human-like delay, to first determine the
 # minimal reliable timings (earlier randomized components led to inconsistent results) -
 # will be added back in later.
 # ============================================================================
 # Fixed pause between the catch signal and casting again.
-FISHING_TRIGGER_FIXED_DELAY = 2
+FISHING_TRIGGER_FIXED_DELAY_DEFAULT = 2.0
 # The timeout itself is configurable via "Timeout (s)" in the UI
 # (self.fishing_timeout_var). How often the timeout is checked - not a timing constant of
 # the sequence itself, usually doesn't need to be adjusted.
 FISHING_TRIGGER_TIMEOUT_CHECK_MS = 1000
 # At Start, we don't wait for the first real bite - the routine instead runs for the
 # first time already after this short startup delay (see _toggle_monitoring).
-FISHING_TRIGGER_INITIAL_DELAY_SECONDS = 5.0
+FISHING_TRIGGER_INITIAL_DELAY_DEFAULT = 5.0
 
 # How often it's checked whether the Attack interval has elapsed (see _check_attack_timer) -
 # not a timing constant of the sequence itself, usually doesn't need to be adjusted.
 ATTACK_TIMER_CHECK_MS = 1000
 
-# Cooldown is deliberately fixed (no UI/settings) - time between two live detection hits.
-COOLDOWN_SECONDS = 2.0
+# Time between two live detection hits.
+COOLDOWN_DEFAULT = 2.0
 
-# Its own pause after the Lure signal, independent of FISHING_TRIGGER_FIXED_DELAY - the
-# lure itself also takes a moment until it's actually applied/landed.
-LURE_TRIGGER_FIXED_DELAY = 2.0
+# Its own pause after the Lure signal, independent of the fishing fixed delay - the lure
+# itself also takes a moment until it's actually applied/landed.
+LURE_TRIGGER_FIXED_DELAY_DEFAULT = 2.0
 
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
 # fishing-trigger sequence while the one triggered by the lure is still running (see
 # _on_trigger_fired).
-LURE_SPLASH_IGNORE_SECONDS = 4.0
+LURE_SPLASH_IGNORE_DEFAULT = 4.0
+
+# Spinbox range/step shared by all timing fields in the "Timing" dialog.
+TIMING_DIALOG_SPINBOX_RANGE = (0.0, 60.0, 0.5)
 
 
 class TriggerEditor(tk.Tk):
@@ -129,6 +133,15 @@ class TriggerEditor(tk.Tk):
         # sound as a new bite (see _on_trigger_fired).
         self.lure_fired_at = None
         self.attack_last_used_at = None
+
+        # Timing values adjustable via the "Timing" dialog (see _open_timing_dialog),
+        # persisted in settings.json just like the other trigger settings.
+        self.fishing_fixed_delay_var = tk.DoubleVar(value=FISHING_TRIGGER_FIXED_DELAY_DEFAULT)
+        self.fishing_initial_delay_var = tk.DoubleVar(value=FISHING_TRIGGER_INITIAL_DELAY_DEFAULT)
+        self.lure_fixed_delay_var = tk.DoubleVar(value=LURE_TRIGGER_FIXED_DELAY_DEFAULT)
+        self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
+        self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
+        self.timing_dialog = None
 
         # Trigger counter/runtime: persisted via settings.json (see
         # _load_settings/_save_settings), only reset explicitly via the Reset button.
@@ -348,6 +361,10 @@ class TriggerEditor(tk.Tk):
 
         self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
         self.monitor_button.pack(side="left", padx=(16, 4))
+
+        ttk.Button(monitor_frame, text="Timing", width=BUTTON_WIDTH, command=self._open_timing_dialog).pack(
+            side="left", padx=(4, 4)
+        )
 
         # Trigger counter + runtime: persisted via settings.json (self.trigger_count/
         # self.total_runtime_seconds are already initialized/loaded in __init__).
@@ -688,6 +705,17 @@ class TriggerEditor(tk.Tk):
         if "attack_interval_seconds" in settings:
             self.attack_interval_var.set(float(settings["attack_interval_seconds"]))
 
+        if "fishing_fixed_delay_seconds" in settings:
+            self.fishing_fixed_delay_var.set(float(settings["fishing_fixed_delay_seconds"]))
+        if "fishing_initial_delay_seconds" in settings:
+            self.fishing_initial_delay_var.set(float(settings["fishing_initial_delay_seconds"]))
+        if "lure_fixed_delay_seconds" in settings:
+            self.lure_fixed_delay_var.set(float(settings["lure_fixed_delay_seconds"]))
+        if "lure_splash_ignore_seconds" in settings:
+            self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
+        if "cooldown_seconds" in settings:
+            self.cooldown_var.set(float(settings["cooldown_seconds"]))
+
         self.trigger_count = int(settings.get("trigger_count", 0))
         self.total_runtime_seconds = float(settings.get("total_runtime_seconds", 0.0))
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
@@ -726,6 +754,11 @@ class TriggerEditor(tk.Tk):
             ("fishing_timeout_seconds", self.fishing_timeout_var),
             ("lure_interval_seconds", self.lure_interval_var),
             ("attack_interval_seconds", self.attack_interval_var),
+            ("fishing_fixed_delay_seconds", self.fishing_fixed_delay_var),
+            ("fishing_initial_delay_seconds", self.fishing_initial_delay_var),
+            ("lure_fixed_delay_seconds", self.lure_fixed_delay_var),
+            ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
+            ("cooldown_seconds", self.cooldown_var),
         ):
             value = self._safe_float(var)
             if value is not None:
@@ -807,19 +840,25 @@ class TriggerEditor(tk.Tk):
         if threshold is None:
             threshold = -40.0
 
-        self.monitor = LiveMonitor(speaker, threshold, COOLDOWN_SECONDS, self._handle_trigger)
+        cooldown = self._safe_float(self.cooldown_var)
+        if cooldown is None:
+            cooldown = COOLDOWN_DEFAULT
+        self.monitor = LiveMonitor(speaker, threshold, cooldown, self._handle_trigger)
         threading.Thread(target=self.monitor.run, daemon=True).start()
         self.monitor_button.config(text="Stop")
         self._log(f"Started (threshold={threshold:.1f} dB).")
 
         # We don't wait for the first real bite - last_cast_at is pre-set so that the
         # timeout routine (see _check_fishing_trigger_timeout) fires for the first time
-        # already after FISHING_TRIGGER_INITIAL_DELAY_SECONDS, not only after the full
-        # timeout configured in the UI.
+        # already after the Fishing Initial Delay (see the "Timing" dialog), not only after
+        # the full timeout configured in the UI.
         fishing_timeout = self._safe_float(self.fishing_timeout_var)
         if fishing_timeout is None:
             fishing_timeout = 24.0
-        self.last_cast_at = time.perf_counter() - (fishing_timeout - FISHING_TRIGGER_INITIAL_DELAY_SECONDS)
+        initial_delay = self._safe_float(self.fishing_initial_delay_var)
+        if initial_delay is None:
+            initial_delay = FISHING_TRIGGER_INITIAL_DELAY_DEFAULT
+        self.last_cast_at = time.perf_counter() - (fishing_timeout - initial_delay)
         self._check_fishing_trigger_timeout()
 
         # No more periodic timer of its own - the lure is now only used as part of a real
@@ -855,6 +894,53 @@ class TriggerEditor(tk.Tk):
         self._save_settings()
         self._log("Trigger counter and runtime reset.")
 
+    def _open_timing_dialog(self):
+        # Advanced timing values that don't have their own field in the main window - kept
+        # in a separate dialog so the main window doesn't get cluttered as more of these
+        # get added over time.
+        if self.timing_dialog is not None and self.timing_dialog.winfo_exists():
+            self.timing_dialog.lift()
+            self.timing_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Timing")
+        dialog.configure(bg=BG)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        self.timing_dialog = dialog
+
+        def on_close():
+            self.timing_dialog = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        frame = ttk.Frame(dialog)
+        frame.pack(padx=12, pady=12)
+
+        from_, to, increment = TIMING_DIALOG_SPINBOX_RANGE
+        fields = (
+            ("Fishing Fixed Delay (s):", self.fishing_fixed_delay_var),
+            ("Fishing Initial Delay (s):", self.fishing_initial_delay_var),
+            ("Lure Fixed Delay (s):", self.lure_fixed_delay_var),
+            ("Lure Splash Ignore (s):", self.lure_splash_ignore_var),
+            ("Cooldown (s):", self.cooldown_var),
+        )
+        for row, (label, var) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            spinbox = ttk.Spinbox(frame, from_=from_, to=to, increment=increment, textvariable=var, width=6)
+            spinbox.grid(row=row, column=1, sticky="w", pady=4)
+            for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+                spinbox.bind(event, lambda e: self._on_timing_settings_changed())
+
+    def _on_timing_settings_changed(self):
+        self._save_settings()
+        if self.monitor is not None:
+            cooldown = self._safe_float(self.cooldown_var)
+            if cooldown is not None:
+                self.monitor.cooldown = cooldown
+
     def _on_close(self):
         if self.monitor is not None:
             self.total_runtime_seconds += time.perf_counter() - self.session_started_at
@@ -882,11 +968,14 @@ class TriggerEditor(tk.Tk):
     def _on_trigger_fired(self, db):
         # The lure itself makes an audible splash when it hits the water and would
         # otherwise immediately re-trigger this trigger, while the sequence it caused is
-        # still running (see LURE_SPLASH_IGNORE_SECONDS) - this was the cause of the
-        # overlapping, jumbled-up send order.
+        # still running (see the "Lure Splash Ignore" timing value) - this was the cause of
+        # the overlapping, jumbled-up send order.
+        lure_splash_ignore = self._safe_float(self.lure_splash_ignore_var)
+        if lure_splash_ignore is None:
+            lure_splash_ignore = LURE_SPLASH_IGNORE_DEFAULT
         if (
             self.lure_fired_at is not None
-            and time.perf_counter() - self.lure_fired_at < LURE_SPLASH_IGNORE_SECONDS
+            and time.perf_counter() - self.lure_fired_at < lure_splash_ignore
         ):
             self._log(f"Threshold detected: {db:.1f} dB (ignored, recent lure splash)")
             return
@@ -898,13 +987,22 @@ class TriggerEditor(tk.Tk):
         self.trigger_count += 1
         self.trigger_count_var.set(f"Triggers: {self.trigger_count}")
         self._save_settings()
-        # Make this decision here (main thread), not only in the background thread of
-        # _run_fishing_trigger - Tk variables (self.lure_interval_var) should only be read
-        # from the main thread. Deliberately defensive: an invalid/empty spinbox value (e.g.
-        # while the user is currently typing in it) must never prevent the Fishing Trigger
-        # itself - at worst, only the lure use is skipped this one time.
+        # Make these decisions/reads here (main thread), not only in the background thread of
+        # _run_fishing_trigger - Tk variables should only be read from the main thread.
+        # Deliberately defensive: an invalid/empty spinbox value (e.g. while the user is
+        # currently typing in it) must never prevent the Fishing Trigger itself - at worst,
+        # only the lure use is skipped this one time, and the timing values fall back to
+        # their coded defaults.
         use_lure = self._should_use_lure()
-        threading.Thread(target=self._run_fishing_trigger, args=(use_lure,), daemon=True).start()
+        fixed_delay = self._safe_float(self.fishing_fixed_delay_var)
+        if fixed_delay is None:
+            fixed_delay = FISHING_TRIGGER_FIXED_DELAY_DEFAULT
+        lure_fixed_delay = self._safe_float(self.lure_fixed_delay_var)
+        if lure_fixed_delay is None:
+            lure_fixed_delay = LURE_TRIGGER_FIXED_DELAY_DEFAULT
+        threading.Thread(
+            target=self._run_fishing_trigger, args=(use_lure, fixed_delay, lure_fixed_delay), daemon=True
+        ).start()
 
     def _should_use_lure(self):
         try:
@@ -917,24 +1015,27 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.lure_last_used_at >= lure_interval
         )
 
-    def _run_fishing_trigger(self, use_lure):
+    def _run_fishing_trigger(self, use_lure, fixed_delay, lure_fixed_delay):
         # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
         # sending + logging is brought back to the main thread via self.after (Tkinter is not
         # thread-safe). Sequence: catch -> fixed pause -> (optional) lure as its own
         # in-between sequence with its own fixed pause afterwards (the lure itself also takes
         # a moment until it's actually applied) -> cast again. Deliberately still without any
-        # randomized/human-like delay (see FISHING_TRIGGER_FIXED_DELAY) - first determine the
-        # minimal, reliable timings, randomized components get added back in afterwards.
+        # randomized/human-like delay - first determine the minimal, reliable timings,
+        # randomized components get added back in afterwards. fixed_delay/lure_fixed_delay
+        # are read from the "Timing" dialog's Tk variables on the main thread by the caller
+        # (_on_trigger_fired) and passed in here as plain values, since Tk variables must not
+        # be read from a background thread.
         self.after(0, self._send_fishing_signal)
-        time.sleep(FISHING_TRIGGER_FIXED_DELAY)
+        time.sleep(fixed_delay)
         if use_lure:
             # The lure is used after the catch signal, so it must happen before casting
             # again (see _send_lure_signal, resets lure_last_used_at, which
-            # _on_trigger_fired's LURE_SPLASH_IGNORE_SECONDS lockout relies on). Afterwards
-            # its own fixed pause (independent of FISHING_TRIGGER_FIXED_DELAY), so the lure
-            # itself has time to land before continuing with the normal sequence.
+            # _on_trigger_fired's lure-splash-ignore lockout relies on). Afterwards its own
+            # fixed pause (independent of fixed_delay), so the lure itself has time to land
+            # before continuing with the normal sequence.
             self.after(0, self._send_lure_signal)
-            time.sleep(LURE_TRIGGER_FIXED_DELAY)
+            time.sleep(lure_fixed_delay)
         self.after(0, self._send_fishing_signal)
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
