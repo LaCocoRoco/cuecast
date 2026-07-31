@@ -923,17 +923,21 @@ class TriggerEditor(tk.Tk):
     def _run_angel_trigger(self, use_lure):
         # Läuft in einem eigenen Thread, damit die Wartezeiten nicht die Tkinter-Oberfläche
         # blockieren. Das eigentliche Senden + Loggen wird per self.after auf den
-        # Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher). Ablauf: Fangen ->
-        # (optional) Lure -> feste Pause -> erneutes Auswerfen. Keine variable Wartezeit vor
-        # dem erneuten Auswerfen mehr.
+        # Hauptthread zurückgeholt (Tkinter ist nicht thread-sicher). Ablauf: Fangen -> feste
+        # Pause -> (optional) Lure als eigene Zwischensequenz mit eigener fester Pause danach
+        # (der Lure selbst braucht auch kurz Zeit, bis er tatsächlich angewendet ist) ->
+        # erneutes Auswerfen. Keine variable Wartezeit vor dem erneuten Auswerfen mehr.
         time.sleep(random.uniform(*ANGEL_TRIGGER_FIRST_DELAY_RANGE))
         self.after(0, self._send_angel_signal)
-        if use_lure:
-            # Lure wird zwischen Fangen- und Auswerfen-Signal verwendet - muss also vor dem
-            # erneuten Auswerfen passieren (siehe _send_lure_signal, setzt lure_last_used_at
-            # zurueck, worauf _on_trigger_fired die LURE_SPLASH_IGNORE_SECONDS-Sperre stützt).
-            self.after(0, self._send_lure_signal)
         time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
+        if use_lure:
+            # Lure wird nach dem Fangen-Signal verwendet, muss also vor dem erneuten
+            # Auswerfen passieren (siehe _send_lure_signal, setzt lure_last_used_at zurueck,
+            # worauf _on_trigger_fired die LURE_SPLASH_IGNORE_SECONDS-Sperre stützt). Danach
+            # nochmal dieselbe feste Pause, damit der Lure selbst Zeit hat anzukommen, bevor
+            # es mit der normalen Sequenz weitergeht.
+            self.after(0, self._send_lure_signal)
+            time.sleep(ANGEL_TRIGGER_FIXED_DELAY)
         self.after(0, self._send_angel_signal)
         # Neuer Wurf beginnt jetzt - die Timeout-Uhr (siehe _check_angel_trigger_timeout)
         # läuft ab hier wieder von vorne.
@@ -960,7 +964,7 @@ class TriggerEditor(tk.Tk):
                 # dann bleibt dauerhaft nichts ausgeworfen und der Timeout feuert immer
                 # wieder ergebnislos. Mit nur einem Druck pro Timeout pendelt sich der
                 # Zustand über die nächsten Zyklen von selbst ein.
-                self._log(f"No bite within {angel_timeout:.0f}s - pressing signal once.")
+                self._log(f"No bite within {angel_timeout:.0f}s.")
                 self.last_cast_at = time.perf_counter()
                 self._send_angel_signal()
         except (ValueError, tk.TclError) as exc:
