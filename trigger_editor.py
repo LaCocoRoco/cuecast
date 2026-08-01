@@ -435,7 +435,7 @@ class TriggerEditor(tk.Tk):
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
 
         ttk.Label(monitor_frame, text="Threshold (dB):").pack(side="left")
-        self.threshold_var = tk.DoubleVar(value=-40.0)
+        self.threshold_var = tk.DoubleVar(value=-28.0)
         threshold_spinbox = ttk.Spinbox(
             monitor_frame, from_=-80.0, to=0.0, increment=1.0, textvariable=self.threshold_var, width=6
         )
@@ -987,7 +987,7 @@ class TriggerEditor(tk.Tk):
         # empty/invalid - should not prevent "Start".
         threshold = self._safe_float(self.threshold_var)
         if threshold is None:
-            threshold = -40.0
+            threshold = -28.0
 
         cooldown = self._safe_float(self.cooldown_var)
         if cooldown is None:
