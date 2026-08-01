@@ -41,9 +41,8 @@ don't have to guess a Threshold by hand.
 ## Timing
 
 The "Timing" dialog exposes the fine delays between each step (plus an optional randomized
-range for each), the Start warm-up, and a failsafe that pauses Fishing if the Threshold fires
-suspiciously often. On a slower PC, these may need to be increased - a sluggish system can
-make sends/detection lag behind the defaults tuned on a faster one.
+range for each) and the Start warm-up. On a slower PC, these may need to be increased - a
+sluggish system can make sends/detection lag behind the defaults tuned on a faster one.
 
 ## Settings
 

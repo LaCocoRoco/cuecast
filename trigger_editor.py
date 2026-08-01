@@ -108,18 +108,8 @@ UTILITY_DELAY_RANGE_DEFAULT = 2.5
 # _on_trigger_fired).
 LURE_SPLASH_IGNORE_DEFAULT = 4.0
 
-# Failsafe: if the Threshold is misconfigured (e.g. set too sensitive) or something else
-# keeps feeding it loud audio, real detections could otherwise fire Fishing in an unbounded
-# loop. If it fires this many times within one fishing-timeout window, we stop
-# reacting to detections entirely until the timeout itself elapses and sends its own single
-# recovery press (see _on_trigger_fired/_check_fishing_trigger_timeout, which also clears
-# this state again) - after that, normal detection resumes and could trip the failsafe again
-# if the same problem persists.
-FAILSAFE_TRIGGER_COUNT_DEFAULT = 4.0
-
 # Spinbox range/step shared by all timing fields in the "Timing" dialog.
 TIMING_DIALOG_SPINBOX_RANGE = (0.0, 60.0, 0.5)
-TIMING_DIALOG_COUNT_RANGE = (2.0, 20.0, 1.0)
 
 
 class TriggerEditor(tk.Tk):
@@ -158,13 +148,6 @@ class TriggerEditor(tk.Tk):
         self.utility_last_used_at = None
         self.attack_last_used_at = None
 
-        # Failsafe state (see _on_trigger_fired/_check_fishing_trigger_timeout):
-        # threshold_trigger_times holds the perf_counter() timestamps of recent real
-        # detections that were actually allowed to fire, so we can tell whether there were
-        # too many of them within one fishing-timeout window.
-        self.threshold_trigger_times = []
-        self.failsafe_active = False
-
         # Timing values adjustable via the "Timing" dialog (see _open_timing_dialog),
         # persisted in settings.json just like the other trigger settings. Fishing/Lure/
         # Utility Delay each have a companion "range" var - 0 keeps the delay fixed at the
@@ -179,7 +162,6 @@ class TriggerEditor(tk.Tk):
         self.utility_delay_range_var = tk.DoubleVar(value=UTILITY_DELAY_RANGE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
-        self.failsafe_trigger_count_var = tk.DoubleVar(value=FAILSAFE_TRIGGER_COUNT_DEFAULT)
         self.timing_dialog = None
 
         # Trigger counter/runtime: persisted via settings.json (see
@@ -435,7 +417,7 @@ class TriggerEditor(tk.Tk):
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
 
         ttk.Label(monitor_frame, text="Threshold (dB):").pack(side="left")
-        self.threshold_var = tk.DoubleVar(value=-28.0)
+        self.threshold_var = tk.DoubleVar(value=-26.0)
         threshold_spinbox = ttk.Spinbox(
             monitor_frame, from_=-80.0, to=0.0, increment=1.0, textvariable=self.threshold_var, width=6
         )
@@ -833,8 +815,6 @@ class TriggerEditor(tk.Tk):
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
             self.cooldown_var.set(float(settings["cooldown_seconds"]))
-        if "failsafe_trigger_count" in settings:
-            self.failsafe_trigger_count_var.set(float(settings["failsafe_trigger_count"]))
 
         self.trigger_count = int(settings.get("trigger_count", 0))
         self.total_runtime_seconds = float(settings.get("total_runtime_seconds", 0.0))
@@ -904,7 +884,6 @@ class TriggerEditor(tk.Tk):
             ("utility_delay_range_seconds", self.utility_delay_range_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
-            ("failsafe_trigger_count", self.failsafe_trigger_count_var),
         ):
             value = self._safe_float(var)
             if value is not None:
@@ -971,8 +950,6 @@ class TriggerEditor(tk.Tk):
             self.lure_fired_at = None
             self.utility_last_used_at = None
             self.attack_last_used_at = None
-            self.failsafe_active = False
-            self.threshold_trigger_times = []
             # Add this start-stop segment's runtime to the total and persist it - the
             # display stops counting up from here (see _update_runtime_display).
             self.total_runtime_seconds += time.perf_counter() - self.session_started_at
@@ -987,7 +964,7 @@ class TriggerEditor(tk.Tk):
         # empty/invalid - should not prevent "Start".
         threshold = self._safe_float(self.threshold_var)
         if threshold is None:
-            threshold = -28.0
+            threshold = -26.0
 
         cooldown = self._safe_float(self.cooldown_var)
         if cooldown is None:
@@ -1104,7 +1081,6 @@ class TriggerEditor(tk.Tk):
             ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
-            ("Failsafe Trigger Count:", self.failsafe_trigger_count_var, TIMING_DIALOG_COUNT_RANGE, None),
         )
         for row, (label, var, (from_, to, increment), range_var) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -1174,28 +1150,6 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.lure_fired_at < lure_splash_ignore
         ):
             self._log(f"Threshold detected: {db:.1f} dB (ignored, recent lure splash)")
-            return
-
-        # Failsafe: while active, ignore real detections entirely and leave last_cast_at
-        # alone, so the independent timeout check (_check_fishing_trigger_timeout) is the
-        # only thing that can still fire - once it does, it clears this state again.
-        if self.failsafe_active:
-            self._log(f"Threshold detected: {db:.1f} dB (ignored, failsafe active)")
-            return
-
-        now = time.perf_counter()
-        fishing_timeout = self._safe_float(self.fishing_timeout_var)
-        if fishing_timeout is None:
-            fishing_timeout = 24.0
-        self.threshold_trigger_times = [t for t in self.threshold_trigger_times if now - t < fishing_timeout]
-        self.threshold_trigger_times.append(now)
-
-        failsafe_count = self._safe_float(self.failsafe_trigger_count_var)
-        if failsafe_count is None:
-            failsafe_count = FAILSAFE_TRIGGER_COUNT_DEFAULT
-        if len(self.threshold_trigger_times) >= failsafe_count:
-            self._log("Too many Threshold triggers in a short time - waiting for timeout.")
-            self.failsafe_active = True
             return
 
         self._log(f"Threshold detected: {db:.1f} dB")
@@ -1327,10 +1281,6 @@ class TriggerEditor(tk.Tk):
                 # timeout, the state settles itself out over the next cycles.
                 self._log(f"No bite within {fishing_timeout:.0f}s.")
                 self.last_cast_at = time.perf_counter()
-                # The timeout elapsing is also the recovery point for the failsafe (see
-                # _on_trigger_fired) - clear it so normal detection resumes from here.
-                self.failsafe_active = False
-                self.threshold_trigger_times = []
                 self._send_fishing_signal()
         except (ValueError, tk.TclError) as exc:
             self._log(f"Fishing trigger timeout check error: {exc}")
