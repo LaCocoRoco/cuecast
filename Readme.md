@@ -1,8 +1,17 @@
 # Cuecast
 
+> 100% vibe-coded with Claude. I didn't hand-write a line of it, and I don't care.
+
 Audio-threshold-based trigger tool: listens to loopback audio, and reacts to loud events by
-sending configured key combinations (via the Interception HID driver). Originally built
-around a WoW fishing use case, hence the "Fishing" / "Lure" / "Attack" terminology.
+sending configured key combinations. Originally built around a WoW fishing use case, hence
+the "Fishing" / "Lure" / "Utility" / "Attack" terminology.
+
+## Why HID
+
+Key presses go exclusively through the [Interception](https://github.com/oblitum/Interception)
+kernel driver, not `SendMessage`/`PostMessage`. Interception acts as a real keyboard at the
+driver level, so input is indistinguishable from an actual keypress - unlike injected window
+messages, which are trivially detectable as not coming from real hardware.
 
 ## Audio detection
 
@@ -12,42 +21,31 @@ UI). No waveform/template matching - real in-game sounds vary too much in timing
 reliable cross-correlation, but are consistently louder than the silence/background noise
 between them.
 
-## The main loop
+## Recording & Threshold
 
-```
-Start
-  -> short warm-up (5s, fixed) before the timeout routine engages
-  -> Fishing Trigger: cast
+Record a short snippet of loopback audio, mark the loud part in the waveform, and hit "Apply
+as Threshold" - it suggests a dB value just below the loudest block in the selection, so you
+don't have to guess a Threshold by hand.
 
-Threshold detected
-  -> Fishing Trigger: reel in
-  -> if Lure Delay > 0 and enough time has passed since the last Lure use:
-       -> fixed pause
-       -> Lure Trigger: use lure
-       -> fixed pause (own delay, independent of the one above - the lure
-          itself takes a moment to actually land/apply)
-       -> ignore the Threshold for 2s from the moment the lure was used (it
-          makes a splash when it hits the water, which would otherwise
-          immediately re-trigger this whole sequence)
-  -> fixed pause
-  -> Fishing Trigger: cast again
+## Triggers
 
-Timeout (no bite within the configured time)
-  -> Fishing Trigger: cast (acts like a toggle - if still "fishing", this
-     interrupts it; the loop naturally recovers on the next cycle)
-```
+- **Fishing** - fires on a real Threshold detection, and once again if no bite comes within
+  the configured timeout. ⓘ hints at installing the "Better Fishing" addon.
+- **Lure** - not a timer of its own; fires as part of a real bite once its delay has elapsed
+  since the last use.
+- **Utility** - works exactly like Lure, just with its own key/delay.
+- **Attack** - fully independent, fires on its own fixed interval the whole time monitoring
+  is active. ⓘ hints at enabling Action Targeting so it doesn't interrupt fishing.
 
-Currently deliberately free of any randomized/humanized delays - those had led to
-inconsistent results, so the minimal reliable timings are being determined first; randomness
-can be reintroduced later once those are known.
+## Timing
 
-Attack Trigger runs completely independently of the above: as long as its own interval is
-set above 0, it just presses its configured key on that interval, the whole time monitoring
-is active.
+The "Timing" dialog exposes the fine delays between each step (plus an optional randomized
+range for each), the Start warm-up, and a failsafe that pauses Fishing if the Threshold fires
+suspiciously often. On a slower PC, these may need to be increased - a sluggish system can
+make sends/detection lag behind the defaults tuned on a faster one.
 
 ## Settings
 
 All key combinations (modifiers + main key), the Threshold, and the various timing values
-(Fishing Timeout, Lure Delay, Attack Interval) are configurable in the UI and persisted in
-`settings.json`, keyed per value - a value missing from a fresh `settings.json` simply falls
-back to its built-in default.
+are configurable in the UI and persisted in `settings.json`, keyed per value - a value
+missing from a fresh `settings.json` simply falls back to its built-in default.
