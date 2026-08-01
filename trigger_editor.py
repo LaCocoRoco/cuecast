@@ -64,7 +64,7 @@ WAVEFORM_HEIGHT = 100
 
 # ============================================================================
 # Fishing trigger timing - the actual values are user-adjustable via the "Timing" dialog
-# (see _open_timing_dialog) and persisted in settings.json; these are just the defaults for
+# (see _toggle_timing_dialog) and persisted in settings.json; these are just the defaults for
 # a fresh settings.json (see __init__ for where the Tk variables are created).
 # Fishing/Lure/Utility Delay each have a companion "range" value (also in the Timing
 # dialog): 0 keeps the delay fixed at exactly the base value; a nonzero range instead picks
@@ -87,6 +87,12 @@ START_DELAY_DEFAULT = 5.0
 # How often it's checked whether the Attack interval has elapsed (see _check_attack_timer) -
 # not a timing constant of the sequence itself, usually doesn't need to be adjusted.
 ATTACK_TIMER_CHECK_MS = 1000
+
+# Added on top of the configured Attack Interval (see _check_attack_timer/_send_attack_signal) -
+# a fixed interval alone (e.g. exactly every 4s) is not human, no one presses a button on such
+# a precise cadence. A fresh value is picked each time Attack fires, for the next cycle.
+ATTACK_DELAY_DEFAULT = 1.5
+ATTACK_DELAY_RANGE_DEFAULT = 2.5
 
 # Time between two live detection hits.
 COOLDOWN_DEFAULT = 2.0
@@ -147,12 +153,16 @@ class TriggerEditor(tk.Tk):
         self.lure_fired_at = None
         self.utility_last_used_at = None
         self.attack_last_used_at = None
+        # Randomized on top of the configured Attack Interval - a fresh value picked each
+        # time Attack fires (see _send_attack_signal), applied to the next cycle by
+        # _check_attack_timer.
+        self.attack_extra_delay = 0.0
 
-        # Timing values adjustable via the "Timing" dialog (see _open_timing_dialog),
+        # Timing values adjustable via the "Timing" dialog (see _toggle_timing_dialog),
         # persisted in settings.json just like the other trigger settings. Fishing/Lure/
-        # Utility Delay each have a companion "range" var - 0 keeps the delay fixed at the
-        # base value, a nonzero range randomizes it (see _resolve_randomized_delay). Start
-        # Delay is deliberately fixed, no range var.
+        # Utility/Attack Delay each have a companion "range" var - 0 keeps the delay fixed
+        # at the base value, a nonzero range randomizes it (see _resolve_randomized_delay).
+        # Start Delay is deliberately fixed, no range var.
         self.fishing_delay_var = tk.DoubleVar(value=FISHING_DELAY_DEFAULT)
         self.fishing_delay_range_var = tk.DoubleVar(value=FISHING_DELAY_RANGE_DEFAULT)
         self.start_delay_var = tk.DoubleVar(value=START_DELAY_DEFAULT)
@@ -160,6 +170,8 @@ class TriggerEditor(tk.Tk):
         self.lure_delay_range_var = tk.DoubleVar(value=LURE_DELAY_RANGE_DEFAULT)
         self.utility_delay_var = tk.DoubleVar(value=UTILITY_DELAY_DEFAULT)
         self.utility_delay_range_var = tk.DoubleVar(value=UTILITY_DELAY_RANGE_DEFAULT)
+        self.attack_delay_var = tk.DoubleVar(value=ATTACK_DELAY_DEFAULT)
+        self.attack_delay_range_var = tk.DoubleVar(value=ATTACK_DELAY_RANGE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
         self.timing_dialog = None
@@ -338,7 +350,7 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.grid(row=1, column=4, sticky="w", padx=4, pady=2)
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Delay (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
+        ttk.Label(trigger_frame, text="Interval (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
         self.lure_interval_var = tk.DoubleVar(value=0.0)
         lure_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
@@ -365,7 +377,7 @@ class TriggerEditor(tk.Tk):
         self.utility_main_key_combo.grid(row=2, column=4, sticky="w", padx=4, pady=2)
         self.utility_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
-        ttk.Label(trigger_frame, text="Delay (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
+        ttk.Label(trigger_frame, text="Interval (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
         self.utility_interval_var = tk.DoubleVar(value=0.0)
         utility_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.utility_interval_var, width=6
@@ -428,7 +440,7 @@ class TriggerEditor(tk.Tk):
         self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
         self.monitor_button.pack(side="left", padx=(16, 4))
 
-        ttk.Button(monitor_frame, text="Timing", width=BUTTON_WIDTH, command=self._open_timing_dialog).pack(
+        ttk.Button(monitor_frame, text="Timing", width=BUTTON_WIDTH, command=self._toggle_timing_dialog).pack(
             side="left", padx=(4, 4)
         )
 
@@ -811,6 +823,10 @@ class TriggerEditor(tk.Tk):
             self.utility_delay_var.set(float(settings["utility_delay_seconds"]))
         if "utility_delay_range_seconds" in settings:
             self.utility_delay_range_var.set(float(settings["utility_delay_range_seconds"]))
+        if "attack_delay_seconds" in settings:
+            self.attack_delay_var.set(float(settings["attack_delay_seconds"]))
+        if "attack_delay_range_seconds" in settings:
+            self.attack_delay_range_var.set(float(settings["attack_delay_range_seconds"]))
         if "lure_splash_ignore_seconds" in settings:
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
@@ -882,6 +898,8 @@ class TriggerEditor(tk.Tk):
             ("lure_delay_range_seconds", self.lure_delay_range_var),
             ("utility_delay_seconds", self.utility_delay_var),
             ("utility_delay_range_seconds", self.utility_delay_range_var),
+            ("attack_delay_seconds", self.attack_delay_var),
+            ("attack_delay_range_seconds", self.attack_delay_range_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
         ):
@@ -1018,6 +1036,9 @@ class TriggerEditor(tk.Tk):
         ).start()
 
         self.attack_last_used_at = time.perf_counter()
+        self.attack_extra_delay = self._resolve_randomized_delay(
+            self.attack_delay_var, ATTACK_DELAY_DEFAULT, self.attack_delay_range_var
+        )
         self._check_attack_timer()
 
         self.session_started_at = time.perf_counter()
@@ -1045,13 +1066,13 @@ class TriggerEditor(tk.Tk):
         self._save_settings()
         self._log("Trigger counter and runtime reset.")
 
-    def _open_timing_dialog(self):
+    def _toggle_timing_dialog(self):
         # Advanced timing values that don't have their own field in the main window - kept
         # in a separate dialog so the main window doesn't get cluttered as more of these
-        # get added over time.
+        # get added over time. Pressing "Timing" again while it's open just closes it.
         if self.timing_dialog is not None and self.timing_dialog.winfo_exists():
-            self.timing_dialog.lift()
-            self.timing_dialog.focus_force()
+            self.timing_dialog.destroy()
+            self.timing_dialog = None
             return
 
         dialog = tk.Toplevel(self)
@@ -1070,14 +1091,17 @@ class TriggerEditor(tk.Tk):
         frame = ttk.Frame(dialog)
         frame.pack(padx=12, pady=12)
 
-        # Fishing/Lure/Utility Delay each get a companion "range" field (see
+        # Fishing/Lure/Utility/Attack Delay each get a companion "range" field (see
         # _resolve_randomized_delay): 0 keeps the delay fixed at the base value, a nonzero
-        # value randomizes it somewhere between the two fields. Start Delay is fixed, no
-        # range field - it's a one-off startup wait, not part of the humanized in-game timing.
+        # value randomizes it somewhere between the two fields. Attack Delay is added on top
+        # of the configured Attack Interval (see _check_attack_timer), unlike the others
+        # which are in-between pauses within a sequence. Start Delay is fixed, no range field -
+        # it's a one-off startup wait, not part of the humanized in-game timing.
         fields = (
             ("Fishing Delay (s):", self.fishing_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.fishing_delay_range_var),
             ("Lure Delay (s):", self.lure_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.lure_delay_range_var),
             ("Utility Delay (s):", self.utility_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.utility_delay_range_var),
+            ("Attack Delay (s):", self.attack_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.attack_delay_range_var),
             ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
@@ -1290,9 +1314,11 @@ class TriggerEditor(tk.Tk):
     def _check_attack_timer(self):
         # Runs periodically on the Tk main thread, as long as detection is active (reschedules
         # itself via self.after - no separate start/stop needed for this). Deliberately simple
-        # and completely independent of Fishing's timeout/threshold - just fires on
-        # the configured interval. 0 disables it. Rescheduling is deliberately in finally -
-        # see _check_fishing_trigger_timeout for the reasoning.
+        # and completely independent of Fishing's timeout/threshold - just fires on the
+        # configured interval, plus attack_extra_delay (a randomized human touch - see
+        # Attack Delay in the "Timing" dialog and _send_attack_signal, which picks a fresh
+        # value for the next cycle each time Attack fires). 0 disables it. Rescheduling is
+        # deliberately in finally - see _check_fishing_trigger_timeout for the reasoning.
         if self.monitor is None:
             return
         try:
@@ -1300,7 +1326,7 @@ class TriggerEditor(tk.Tk):
             if (
                 interval_seconds > 0
                 and self.attack_last_used_at is not None
-                and time.perf_counter() - self.attack_last_used_at >= interval_seconds
+                and time.perf_counter() - self.attack_last_used_at >= interval_seconds + self.attack_extra_delay
             ):
                 self._send_attack_signal()
         except (ValueError, tk.TclError) as exc:
@@ -1331,9 +1357,12 @@ class TriggerEditor(tk.Tk):
         self._send_signal(self.mod_ctrl_var, self.mod_alt_var, self.mod_shift_var, self.main_key_var, "Fishing")
 
     def _send_attack_signal(self):
-        # Reset the clock, so the next automatic firing waits out the full interval again
-        # from now.
+        # Reset the clock, so the next automatic firing waits out the full interval (plus a
+        # freshly picked attack_extra_delay, see _check_attack_timer) again from now.
         self.attack_last_used_at = time.perf_counter()
+        self.attack_extra_delay = self._resolve_randomized_delay(
+            self.attack_delay_var, ATTACK_DELAY_DEFAULT, self.attack_delay_range_var
+        )
         self._send_signal(
             self.attack_mod_ctrl_var, self.attack_mod_alt_var, self.attack_mod_shift_var, self.attack_main_key_var,
             "Attack",
