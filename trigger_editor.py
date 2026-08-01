@@ -351,7 +351,7 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.lure_interval_var = tk.DoubleVar(value=0.0)
+        self.lure_interval_var = tk.DoubleVar(value=25.0)
         lure_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
         )
@@ -378,7 +378,7 @@ class TriggerEditor(tk.Tk):
         self.utility_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.utility_interval_var = tk.DoubleVar(value=0.0)
+        self.utility_interval_var = tk.DoubleVar(value=1800.0)
         utility_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.utility_interval_var, width=6
         )
@@ -405,7 +405,7 @@ class TriggerEditor(tk.Tk):
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=3, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.attack_interval_var = tk.DoubleVar(value=0.0)
+        self.attack_interval_var = tk.DoubleVar(value=4.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
