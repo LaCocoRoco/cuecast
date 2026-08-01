@@ -1016,9 +1016,33 @@ class TriggerEditor(tk.Tk):
         # No more periodic timer of its own - the lure is now only used as part of a real
         # bite (see _on_trigger_fired/_run_fishing_trigger), lure_last_used_at there only
         # serves as the reference timestamp for "has the wait time elapsed". Utility Trigger
-        # works exactly the same way.
+        # works exactly the same way. Pre-set here as a default in case either is disabled
+        # (interval 0) - if enabled, _run_startup_sequence below updates it to the actual
+        # time it was first used instead.
         self.lure_last_used_at = time.perf_counter()
         self.utility_last_used_at = time.perf_counter()
+
+        # If enabled (interval > 0), Lure/Utility shouldn't sit unused until an interval AND
+        # a real bite happen to coincide - fire each once, in sequence, right after the Start
+        # Delay, same as the Fishing Trigger's own timeout warm-up. Read here (main thread)
+        # and passed into the background thread as plain values, since Tk variables must not
+        # be read from a background thread.
+        lure_interval = self._safe_float(self.lure_interval_var)
+        lure_enabled = lure_interval is not None and lure_interval > 0
+        lure_delay = self._resolve_randomized_delay(
+            self.lure_delay_var, LURE_DELAY_DEFAULT, self.lure_delay_range_var
+        )
+        utility_interval = self._safe_float(self.utility_interval_var)
+        utility_enabled = utility_interval is not None and utility_interval > 0
+        utility_delay = self._resolve_randomized_delay(
+            self.utility_delay_var, UTILITY_DELAY_DEFAULT, self.utility_delay_range_var
+        )
+        if lure_enabled or utility_enabled:
+            threading.Thread(
+                target=self._run_startup_sequence,
+                args=(start_delay, lure_enabled, lure_delay, utility_enabled, utility_delay),
+                daemon=True,
+            ).start()
 
         self.attack_last_used_at = time.perf_counter()
         self._check_attack_timer()
@@ -1261,6 +1285,21 @@ class TriggerEditor(tk.Tk):
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
         self.last_cast_at = time.perf_counter()
+
+    def _run_startup_sequence(self, start_delay, lure_enabled, lure_delay, utility_enabled, utility_delay):
+        # Mirrors the real-bite sequence in _run_fishing_trigger for Lure/Utility, but runs
+        # once right after Start instead of waiting for a real bite - otherwise an enabled
+        # Lure/Utility Trigger would sit unused until its interval AND a real bite happen to
+        # coincide, which with a long interval (e.g. 30+ minutes) could take a very long time.
+        # Waits out the Start Delay first, then Lure and Utility fully in sequence (signal +
+        # its own delay each), same as the real-bite path - never overlapping.
+        time.sleep(start_delay)
+        if lure_enabled:
+            self.after(0, self._send_lure_signal)
+            time.sleep(lure_delay)
+        if utility_enabled:
+            self.after(0, self._send_utility_signal)
+            time.sleep(utility_delay)
 
     def _check_fishing_trigger_timeout(self):
         # Runs periodically on the Tk main thread, as long as detection is active (reschedules
