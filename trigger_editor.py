@@ -66,15 +66,16 @@ WAVEFORM_HEIGHT = 100
 # Fishing trigger timing - the actual values are user-adjustable via the "Timing" dialog
 # (see _open_timing_dialog) and persisted in settings.json; these are just the defaults for
 # a fresh settings.json (see __init__ for where the Tk variables are created).
-# Fishing Delay/Start Delay/Lure Delay each have a companion "range" value (also in the
-# Timing dialog): 0 (the default) keeps the delay fixed at exactly the base value, as
-# before; a nonzero range instead picks a random delay somewhere between the base value and
-# the range value (see _resolve_randomized_delay) - a simple way to make the timing less
-# uniform/predictable without giving up the option of a precise fixed delay.
+# Fishing/Lure/Utility Delay each have a companion "range" value (also in the Timing
+# dialog): 0 keeps the delay fixed at exactly the base value; a nonzero range instead picks
+# a random delay somewhere between the base value and the range value (see
+# _resolve_randomized_delay) - a simple way to make the timing less uniform/predictable
+# without giving up the option of a precise fixed delay. Start Delay is deliberately fixed,
+# no range - it's a one-off startup wait, not part of the humanized in-game timing.
 # ============================================================================
 # Fixed pause between the catch signal and casting again.
-FISHING_DELAY_DEFAULT = 2.0
-FISHING_DELAY_RANGE_DEFAULT = 0.0
+FISHING_DELAY_DEFAULT = 1.5
+FISHING_DELAY_RANGE_DEFAULT = 2.5
 # The timeout itself is configurable via "Timeout (s)" in the UI
 # (self.fishing_timeout_var). How often the timeout is checked - not a timing constant of
 # the sequence itself, usually doesn't need to be adjusted.
@@ -82,7 +83,6 @@ FISHING_TRIGGER_TIMEOUT_CHECK_MS = 1000
 # At Start, we don't wait for the first real bite - the routine instead runs for the
 # first time already after this short startup delay (see _toggle_monitoring).
 START_DELAY_DEFAULT = 5.0
-START_DELAY_RANGE_DEFAULT = 0.0
 
 # How often it's checked whether the Attack interval has elapsed (see _check_attack_timer) -
 # not a timing constant of the sequence itself, usually doesn't need to be adjusted.
@@ -93,14 +93,14 @@ COOLDOWN_DEFAULT = 2.0
 
 # Its own pause after the Lure signal, independent of the fishing delay - the lure itself
 # also takes a moment until it's actually applied/landed.
-LURE_DELAY_DEFAULT = 2.0
-LURE_DELAY_RANGE_DEFAULT = 0.0
+LURE_DELAY_DEFAULT = 1.5
+LURE_DELAY_RANGE_DEFAULT = 2.5
 
 # Its own pause after the Utility signal, same idea as Lure Delay - Utility works exactly
 # like Lure (no timer of its own, only used as part of a real bite once its own delay has
 # elapsed since last use, see _should_use_utility).
-UTILITY_DELAY_DEFAULT = 2.0
-UTILITY_DELAY_RANGE_DEFAULT = 0.0
+UTILITY_DELAY_DEFAULT = 1.5
+UTILITY_DELAY_RANGE_DEFAULT = 2.5
 
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
@@ -166,13 +166,13 @@ class TriggerEditor(tk.Tk):
         self.failsafe_active = False
 
         # Timing values adjustable via the "Timing" dialog (see _open_timing_dialog),
-        # persisted in settings.json just like the other trigger settings. Fishing/Start/
-        # Lure Delay each have a companion "range" var - 0 keeps the delay fixed at the base
-        # value (as before), a nonzero range randomizes it (see _resolve_randomized_delay).
+        # persisted in settings.json just like the other trigger settings. Fishing/Lure/
+        # Utility Delay each have a companion "range" var - 0 keeps the delay fixed at the
+        # base value, a nonzero range randomizes it (see _resolve_randomized_delay). Start
+        # Delay is deliberately fixed, no range var.
         self.fishing_delay_var = tk.DoubleVar(value=FISHING_DELAY_DEFAULT)
         self.fishing_delay_range_var = tk.DoubleVar(value=FISHING_DELAY_RANGE_DEFAULT)
         self.start_delay_var = tk.DoubleVar(value=START_DELAY_DEFAULT)
-        self.start_delay_range_var = tk.DoubleVar(value=START_DELAY_RANGE_DEFAULT)
         self.lure_delay_var = tk.DoubleVar(value=LURE_DELAY_DEFAULT)
         self.lure_delay_range_var = tk.DoubleVar(value=LURE_DELAY_RANGE_DEFAULT)
         self.utility_delay_var = tk.DoubleVar(value=UTILITY_DELAY_DEFAULT)
@@ -821,8 +821,6 @@ class TriggerEditor(tk.Tk):
             self.fishing_delay_range_var.set(float(settings["fishing_delay_range_seconds"]))
         if "start_delay_seconds" in settings:
             self.start_delay_var.set(float(settings["start_delay_seconds"]))
-        if "start_delay_range_seconds" in settings:
-            self.start_delay_range_var.set(float(settings["start_delay_range_seconds"]))
         if "lure_delay_seconds" in settings:
             self.lure_delay_var.set(float(settings["lure_delay_seconds"]))
         if "lure_delay_range_seconds" in settings:
@@ -900,7 +898,6 @@ class TriggerEditor(tk.Tk):
             ("fishing_delay_seconds", self.fishing_delay_var),
             ("fishing_delay_range_seconds", self.fishing_delay_range_var),
             ("start_delay_seconds", self.start_delay_var),
-            ("start_delay_range_seconds", self.start_delay_range_var),
             ("lure_delay_seconds", self.lure_delay_var),
             ("lure_delay_range_seconds", self.lure_delay_range_var),
             ("utility_delay_seconds", self.utility_delay_var),
@@ -1024,9 +1021,9 @@ class TriggerEditor(tk.Tk):
         # "reel in" step since nothing was cast yet, triggered by Start instead of a
         # detection. Read here (main thread) and passed into the background thread as plain
         # values, since Tk variables must not be read from a background thread.
-        start_delay = self._resolve_randomized_delay(
-            self.start_delay_var, START_DELAY_DEFAULT, self.start_delay_range_var
-        )
+        start_delay = self._safe_float(self.start_delay_var)
+        if start_delay is None:
+            start_delay = START_DELAY_DEFAULT
         lure_interval = self._safe_float(self.lure_interval_var)
         lure_enabled = lure_interval is not None and lure_interval > 0
         lure_delay = self._resolve_randomized_delay(
@@ -1096,14 +1093,15 @@ class TriggerEditor(tk.Tk):
         frame = ttk.Frame(dialog)
         frame.pack(padx=12, pady=12)
 
-        # Fishing/Start/Lure/Utility Delay each get a companion "range" field (see
+        # Fishing/Lure/Utility Delay each get a companion "range" field (see
         # _resolve_randomized_delay): 0 keeps the delay fixed at the base value, a nonzero
-        # value randomizes it somewhere between the two fields.
+        # value randomizes it somewhere between the two fields. Start Delay is fixed, no
+        # range field - it's a one-off startup wait, not part of the humanized in-game timing.
         fields = (
             ("Fishing Delay (s):", self.fishing_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.fishing_delay_range_var),
-            ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.start_delay_range_var),
             ("Lure Delay (s):", self.lure_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.lure_delay_range_var),
             ("Utility Delay (s):", self.utility_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.utility_delay_range_var),
+            ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Failsafe Trigger Count:", self.failsafe_trigger_count_var, TIMING_DIALOG_COUNT_RANGE, None),
