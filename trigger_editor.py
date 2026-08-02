@@ -1,9 +1,10 @@
+import math
 import random
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import simpledialog, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import numpy as np
 import winsound
@@ -74,8 +75,8 @@ WAVEFORM_HEIGHT = 100
 # no range - it's a one-off startup wait, not part of the humanized in-game timing.
 # ============================================================================
 # Fixed pause between the catch signal and casting again.
-FISHING_DELAY_DEFAULT = 1.5
-FISHING_DELAY_RANGE_DEFAULT = 2.5
+FISHING_DELAY_DEFAULT = 1.0
+FISHING_DELAY_RANGE_DEFAULT = 0.0
 # The timeout itself is configurable via "Timeout (s)" in the UI
 # (self.fishing_timeout_var). How often the timeout is checked - not a timing constant of
 # the sequence itself, usually doesn't need to be adjusted.
@@ -91,28 +92,28 @@ ATTACK_TIMER_CHECK_MS = 1000
 # Added on top of the configured Attack Interval (see _check_attack_timer/_send_attack_signal) -
 # a fixed interval alone (e.g. exactly every 4s) is not human, no one presses a button on such
 # a precise cadence. A fresh value is picked each time Attack fires, for the next cycle.
-ATTACK_DELAY_DEFAULT = 1.5
-ATTACK_DELAY_RANGE_DEFAULT = 2.5
+ATTACK_DELAY_DEFAULT = 0.0
+ATTACK_DELAY_RANGE_DEFAULT = 1.0
 
 # Time between two live detection hits.
 COOLDOWN_DEFAULT = 2.0
 
 # Its own pause after the Lure signal, independent of the fishing delay - the lure itself
 # also takes a moment until it's actually applied/landed.
-LURE_DELAY_DEFAULT = 1.5
-LURE_DELAY_RANGE_DEFAULT = 2.5
+LURE_DELAY_DEFAULT = 0.0
+LURE_DELAY_RANGE_DEFAULT = 1.0
 
 # Its own pause after the Utility signal, same idea as Lure Delay - Utility works exactly
 # like Lure (no timer of its own, only used as part of a real bite once its own delay has
 # elapsed since last use, see _should_use_utility).
-UTILITY_DELAY_DEFAULT = 1.5
-UTILITY_DELAY_RANGE_DEFAULT = 2.5
+UTILITY_DELAY_DEFAULT = 0.0
+UTILITY_DELAY_RANGE_DEFAULT = 1.0
 
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
 # fishing-trigger sequence while the one triggered by the lure is still running (see
 # _on_trigger_fired).
-LURE_SPLASH_IGNORE_DEFAULT = 4.0
+LURE_SPLASH_IGNORE_DEFAULT = 2.0
 
 # Spinbox range/step shared by all timing fields in the "Timing" dialog.
 TIMING_DIALOG_SPINBOX_RANGE = (0.0, 60.0, 0.5)
@@ -405,7 +406,7 @@ class TriggerEditor(tk.Tk):
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=3, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.attack_interval_var = tk.DoubleVar(value=4.0)
+        self.attack_interval_var = tk.DoubleVar(value=2.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
@@ -429,7 +430,7 @@ class TriggerEditor(tk.Tk):
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
 
         ttk.Label(monitor_frame, text="Threshold (dB):").pack(side="left")
-        self.threshold_var = tk.DoubleVar(value=-26.0)
+        self.threshold_var = tk.DoubleVar(value=0.0)
         threshold_spinbox = ttk.Spinbox(
             monitor_frame, from_=-80.0, to=0.0, increment=1.0, textvariable=self.threshold_var, width=6
         )
@@ -665,10 +666,13 @@ class TriggerEditor(tk.Tk):
         if len(segment) == 0:
             return
         peak_db = compute_peak_db(segment, self.sample_rate)
-        suggested = round(peak_db - THRESHOLD_SUGGESTION_MARGIN_DB, 1)
+        # Floored (not rounded to nearest) to a whole dB, so the result is always at least as
+        # conservative as the raw suggestion (e.g. -55.8 -> -56.0, -24.2 -> -25.0) - never
+        # rounds up into a less safe, more permissive value.
+        suggested = math.floor(peak_db - THRESHOLD_SUGGESTION_MARGIN_DB)
         self.threshold_var.set(suggested)
         self._on_monitor_settings_changed()
-        self._log(f"Threshold set to {suggested:.1f} dB (peak {peak_db:.1f} dB - {THRESHOLD_SUGGESTION_MARGIN_DB:.0f} dB margin).")
+        self._log(f"Threshold set to {suggested:.0f} dB (peak {peak_db:.1f} dB - {THRESHOLD_SUGGESTION_MARGIN_DB:.0f} dB margin).")
 
     def _determine_range(self):
         if self.selection:
@@ -924,6 +928,30 @@ class TriggerEditor(tk.Tk):
 
     def _toggle_hid_driver(self):
         installed = interception_driver.is_installed()
+        action_word = "uninstall" if installed else "install"
+        # Observed in practice: installing/uninstalling/installing again without a restart
+        # in between can leave the keyboard/mouse (all HID devices) unresponsive - a
+        # restart is required after EVERY install/uninstall before doing it again, not just
+        # a recommendation. Requires explicit confirmation since it can lock the user out of
+        # normal input if ignored.
+        if not messagebox.askokcancel(
+            "Restart required",
+            f"This will {action_word} the Interception HID driver.\n\n"
+            "IMPORTANT: A full system restart is required before installing or "
+            "uninstalling this driver again. Toggling install/uninstall/install "
+            "repeatedly without restarting in between can leave your keyboard and mouse "
+            "(all HID devices) unresponsive until you restart.\n\n"
+            "Before continuing, make sure you can restart your PC right away, and that "
+            "you have a way to recover your system if something goes wrong (e.g. a "
+            "System Restore point) - if HID devices stop responding, you may not be able "
+            "to interact with Windows normally.\n\n"
+            "Continue?",
+            icon="warning",
+            default=messagebox.CANCEL,
+        ):
+            self._log(f"{action_word.capitalize()} cancelled.")
+            return
+
         action = interception_driver.uninstall if installed else interception_driver.install
         verb = "Uninstalling" if installed else "Installing"
         self._log(f"{verb} Interception driver (Windows admin prompt may appear)...")
@@ -982,7 +1010,7 @@ class TriggerEditor(tk.Tk):
         # empty/invalid - should not prevent "Start".
         threshold = self._safe_float(self.threshold_var)
         if threshold is None:
-            threshold = -26.0
+            threshold = 0.0
 
         cooldown = self._safe_float(self.cooldown_var)
         if cooldown is None:
@@ -1162,6 +1190,12 @@ class TriggerEditor(tk.Tk):
         self.after(0, self._on_trigger_fired, db)
 
     def _on_trigger_fired(self, db):
+        # Guards against a late-arriving detection right after Stop: LiveMonitor.run() only
+        # checks its stop_event at the top of its loop, so a block that was already being
+        # recorded when Stop was pressed can still call on_trigger once more - this must not
+        # be allowed to start a whole new sequence.
+        if self.monitor is None:
+            return
         # The lure itself makes an audible splash when it hits the water and would
         # otherwise immediately re-trigger this trigger, while the sequence it caused is
         # still running (see the "Lure Splash Ignore" timing value) - this was the cause of
@@ -1241,9 +1275,13 @@ class TriggerEditor(tk.Tk):
         # variables (base value, or a randomized value within a configured range - see
         # _resolve_randomized_delay) on the main thread by the caller (_on_trigger_fired) and
         # passed in here as plain values, since Tk variables must not be read from a
-        # background thread.
+        # background thread. self.monitor is checked after every sleep - Stop sets it to
+        # None, and this thread otherwise has no way of knowing Stop was pressed mid-sequence
+        # (it would just keep sending regardless).
         self.after(0, self._send_fishing_signal)
         time.sleep(fishing_delay)
+        if self.monitor is None:
+            return
         if use_lure:
             # The lure is used after the catch signal, so it must happen before casting
             # again (see _send_lure_signal, resets lure_last_used_at, which
@@ -1252,10 +1290,14 @@ class TriggerEditor(tk.Tk):
             # before continuing with the normal sequence.
             self.after(0, self._send_lure_signal)
             time.sleep(lure_delay)
+            if self.monitor is None:
+                return
         if use_utility:
             # Same idea as the lure: fully sequenced, not overlapping with anything else.
             self.after(0, self._send_utility_signal)
             time.sleep(utility_delay)
+            if self.monitor is None:
+                return
         self.after(0, self._send_fishing_signal)
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
@@ -1269,13 +1311,22 @@ class TriggerEditor(tk.Tk):
         # minutes) could take a very long time. Mirrors the real-bite sequence in
         # _run_fishing_trigger (reel in -> Lure -> Utility -> cast again), just without a
         # "reel in" step since nothing was cast yet. Waits out the Start Delay first.
+        # self.monitor is checked after every sleep - Stop sets it to None, and this thread
+        # otherwise has no way of knowing Stop was pressed mid-sequence (it would just keep
+        # sending regardless, e.g. right after a Start immediately followed by a Stop).
         time.sleep(start_delay)
+        if self.monitor is None:
+            return
         if lure_enabled:
             self.after(0, self._send_lure_signal)
             time.sleep(lure_delay)
+            if self.monitor is None:
+                return
         if utility_enabled:
             self.after(0, self._send_utility_signal)
             time.sleep(utility_delay)
+            if self.monitor is None:
+                return
         self.after(0, self._send_fishing_signal)
         # Real timeout counting starts only now, from this first actual cast (not before,
         # while Lure/Utility were still in progress) - so the next "No bite" (see
