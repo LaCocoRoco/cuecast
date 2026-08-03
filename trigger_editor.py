@@ -118,6 +118,12 @@ UTILITY_DELAY_RANGE_DEFAULT = 1.0
 CHEST_DELAY_DEFAULT = 0.0
 CHEST_DELAY_RANGE_DEFAULT = 1.0
 
+# Randomizes the actual click position around the captured X/Y (see _send_chest_click): 0
+# clicks exactly at the captured position every time; a nonzero value picks an offset
+# somewhere between 0 and this many pixels, independently for X and Y, each randomly added
+# or subtracted - a simple human touch so it doesn't click the exact same pixel every time.
+CHEST_NORMALIZE_DEFAULT = 0.0
+
 # The lure itself causes a splash sound when it hits the water, which exceeds the
 # Threshold again - without this lockout, that would trigger a new, overlapping
 # fishing-trigger sequence while the one triggered by the lure is still running (see
@@ -126,6 +132,8 @@ LURE_SPLASH_IGNORE_DEFAULT = 2.0
 
 # Spinbox range/step shared by all timing fields in the "Timing" dialog.
 TIMING_DIALOG_SPINBOX_RANGE = (0.0, 60.0, 0.5)
+# Wider range/step for the Chest Normalize field (a pixel offset, not a time in seconds).
+CHEST_NORMALIZE_SPINBOX_RANGE = (0.0, 500.0, 1.0)
 
 
 class TriggerEditor(tk.Tk):
@@ -189,6 +197,7 @@ class TriggerEditor(tk.Tk):
         self.attack_delay_range_var = tk.DoubleVar(value=ATTACK_DELAY_RANGE_DEFAULT)
         self.chest_delay_var = tk.DoubleVar(value=CHEST_DELAY_DEFAULT)
         self.chest_delay_range_var = tk.DoubleVar(value=CHEST_DELAY_RANGE_DEFAULT)
+        self.chest_normalize_var = tk.DoubleVar(value=CHEST_NORMALIZE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
         self.timing_dialog = None
@@ -445,13 +454,11 @@ class TriggerEditor(tk.Tk):
         # Row 4: Chest - works exactly like Lure/Utility (no timer of its own, only used as
         # part of a real bite once its own interval has elapsed since last use, see
         # _should_use_chest/_run_fishing_trigger). No Ctrl/Alt/Shift/key of its own (it's a
-        # mouse click at a captured position, not a keypress) - Set/Test take that space
-        # instead, so Interval/its spinbox/info icon still line up with the other rows.
-        # X/Y aren't shown - captured internally via "Set", not something to look at/tweak
-        # directly (see _start_chest_capture).
+        # mouse click at a captured position, not a keypress) - Set/Test/X/Y take that space
+        # instead, so Interval/its spinbox still line up with the other rows. X/Y have no
+        # label (first field X, second Y) - just there so it's visible at a glance that a
+        # position has actually been captured (see _start_chest_capture).
         ttk.Label(trigger_frame, text="Chest:").grid(row=4, column=0, sticky="w", padx=(0, 4), pady=2)
-        self.chest_x_var = tk.DoubleVar(value=0.0)
-        self.chest_y_var = tk.DoubleVar(value=0.0)
 
         self.chest_set_button = ttk.Button(
             trigger_frame, text="Set", width=BUTTON_WIDTH, command=self._start_chest_capture
@@ -464,6 +471,21 @@ class TriggerEditor(tk.Tk):
         ttk.Button(trigger_frame, text="Test", width=BUTTON_WIDTH, command=self._test_chest_click).grid(
             row=4, column=2, sticky="w", padx=4, pady=2
         )
+
+        self.chest_x_var = tk.DoubleVar(value=0.0)
+        chest_x_spinbox = ttk.Spinbox(
+            trigger_frame, from_=0.0, to=10000.0, increment=1.0, textvariable=self.chest_x_var, width=6
+        )
+        chest_x_spinbox.grid(row=4, column=3, sticky="w", padx=(16, 4), pady=2)
+
+        self.chest_y_var = tk.DoubleVar(value=0.0)
+        chest_y_spinbox = ttk.Spinbox(
+            trigger_frame, from_=0.0, to=10000.0, increment=1.0, textvariable=self.chest_y_var, width=6
+        )
+        chest_y_spinbox.grid(row=4, column=4, sticky="w", padx=4, pady=2)
+        for spinbox in (chest_x_spinbox, chest_y_spinbox):
+            for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
+                spinbox.bind(event, lambda e: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=4, column=5, sticky="w", padx=(16, 4), pady=2)
         self.chest_interval_var = tk.DoubleVar(value=0.0)
@@ -491,7 +513,7 @@ class TriggerEditor(tk.Tk):
         self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
         self.monitor_button.pack(side="left", padx=(16, 4))
 
-        ttk.Button(monitor_frame, text="Timing", width=BUTTON_WIDTH, command=self._toggle_timing_dialog).pack(
+        ttk.Button(monitor_frame, text="Settings", width=BUTTON_WIDTH, command=self._toggle_timing_dialog).pack(
             side="left", padx=(4, 4)
         )
 
@@ -893,6 +915,8 @@ class TriggerEditor(tk.Tk):
             self.chest_delay_var.set(float(settings["chest_delay_seconds"]))
         if "chest_delay_range_seconds" in settings:
             self.chest_delay_range_var.set(float(settings["chest_delay_range_seconds"]))
+        if "chest_normalize_px" in settings:
+            self.chest_normalize_var.set(float(settings["chest_normalize_px"]))
         if "lure_splash_ignore_seconds" in settings:
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
@@ -971,6 +995,7 @@ class TriggerEditor(tk.Tk):
             ("attack_delay_range_seconds", self.attack_delay_range_var),
             ("chest_delay_seconds", self.chest_delay_var),
             ("chest_delay_range_seconds", self.chest_delay_range_var),
+            ("chest_normalize_px", self.chest_normalize_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
         ):
@@ -1173,16 +1198,16 @@ class TriggerEditor(tk.Tk):
         self._log("Trigger counter and runtime reset.")
 
     def _toggle_timing_dialog(self):
-        # Advanced timing values that don't have their own field in the main window - kept
-        # in a separate dialog so the main window doesn't get cluttered as more of these
-        # get added over time. Pressing "Timing" again while it's open just closes it.
+        # Advanced settings that don't have their own field in the main window - kept in a
+        # separate dialog so the main window doesn't get cluttered as more of these get
+        # added over time. Pressing "Settings" again while it's open just closes it.
         if self.timing_dialog is not None and self.timing_dialog.winfo_exists():
             self.timing_dialog.destroy()
             self.timing_dialog = None
             return
 
         dialog = tk.Toplevel(self)
-        dialog.title("Timing")
+        dialog.title("Settings")
         dialog.configure(bg=BG)
         dialog.resizable(False, False)
         dialog.transient(self)
@@ -1211,6 +1236,7 @@ class TriggerEditor(tk.Tk):
             ("Utility Delay (s):", self.utility_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.utility_delay_range_var),
             ("Chest Delay (s):", self.chest_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.chest_delay_range_var),
             ("Attack Delay (s):", self.attack_delay_var, TIMING_DIALOG_SPINBOX_RANGE, self.attack_delay_range_var),
+            ("Chest Normalize (px):", self.chest_normalize_var, CHEST_NORMALIZE_SPINBOX_RANGE, None),
             ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
@@ -1570,12 +1596,27 @@ class TriggerEditor(tk.Tk):
             "Attack",
         )
 
+    def _resolve_chest_offset(self):
+        # Chest Normalize (px, see the "Settings" dialog): 0 clicks exactly at the captured
+        # position every time; a nonzero value picks a random offset somewhere between 0 and
+        # that many pixels, independently for X and Y, each randomly added or subtracted - a
+        # simple human touch so it doesn't click the exact same pixel every time.
+        normalize = self._safe_float(self.chest_normalize_var)
+        if not normalize:
+            return 0, 0
+
+        def offset():
+            return round(random.choice((-1, 1)) * random.uniform(0, normalize))
+
+        return offset(), offset()
+
     def _send_chest_click(self):
         # Reset the clock, so the next automatic firing waits out the full interval again
         # from now.
         self.chest_last_used_at = time.perf_counter()
-        x = int(self.chest_x_var.get())
-        y = int(self.chest_y_var.get())
+        offset_x, offset_y = self._resolve_chest_offset()
+        x = int(self.chest_x_var.get()) + offset_x
+        y = int(self.chest_y_var.get()) + offset_y
         try:
             self.input_controller.send_click(x, y, "right")
             self._log(f"Right-clicked chest at ({x}, {y}).")
