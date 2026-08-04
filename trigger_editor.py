@@ -43,12 +43,13 @@ PREVIEW_PATH = Path(__file__).parent / "_preview.wav"
 CLICK_EPSILON = 0.03
 PLAYHEAD_INTERVAL_MS = 30
 
-# Safety margin below the measured peak of a marked selection, when it is applied as the
-# Threshold via the button. A dB difference is already a ratio (dB is logarithmic), so a
-# fixed value here represents the same proportional drop below peak regardless of a
+# Headroom: how far below the measured peak of a marked selection the suggested Threshold
+# is set, when applied via the "Apply as Threshold" button. Adjustable in the "Settings"
+# dialog (see self.headroom_var). A dB difference is already a ratio (dB is logarithmic),
+# so a fixed value here represents the same proportional drop below peak regardless of a
 # device's absolute loudness (e.g. one mic peaking around -20 dB, another around -58 dB) -
 # no separate percentage-based formula is needed on top of it.
-THRESHOLD_SUGGESTION_MARGIN_DB = 6.0
+HEADROOM_DEFAULT = 6.0
 
 # Minimum/default window size (pixels). Must be at least as large as the controls'
 # actual space requirement (see winfo_reqwidth/reqheight).
@@ -200,6 +201,7 @@ class TriggerEditor(tk.Tk):
         self.chest_normalize_var = tk.DoubleVar(value=CHEST_NORMALIZE_DEFAULT)
         self.lure_splash_ignore_var = tk.DoubleVar(value=LURE_SPLASH_IGNORE_DEFAULT)
         self.cooldown_var = tk.DoubleVar(value=COOLDOWN_DEFAULT)
+        self.headroom_var = tk.DoubleVar(value=HEADROOM_DEFAULT)
         self.timing_dialog = None
 
         # Trigger counter/runtime: persisted via settings.json (see
@@ -379,7 +381,7 @@ class TriggerEditor(tk.Tk):
         self.lure_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=1, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.lure_interval_var = tk.DoubleVar(value=25.0)
+        self.lure_interval_var = tk.DoubleVar(value=26.0)
         lure_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.lure_interval_var, width=6
         )
@@ -406,7 +408,7 @@ class TriggerEditor(tk.Tk):
         self.utility_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=2, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.utility_interval_var = tk.DoubleVar(value=1800.0)
+        self.utility_interval_var = tk.DoubleVar(value=1600.0)
         utility_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=3600.0, increment=10.0, textvariable=self.utility_interval_var, width=6
         )
@@ -433,7 +435,7 @@ class TriggerEditor(tk.Tk):
         self.attack_main_key_combo.bind("<<ComboboxSelected>>", lambda event: self._save_settings())
 
         ttk.Label(trigger_frame, text="Interval (s):").grid(row=3, column=5, sticky="w", padx=(16, 4), pady=2)
-        self.attack_interval_var = tk.DoubleVar(value=2.0)
+        self.attack_interval_var = tk.DoubleVar(value=4.0)
         attack_interval_spinbox = ttk.Spinbox(
             trigger_frame, from_=0.0, to=60.0, increment=1.0, textvariable=self.attack_interval_var, width=6
         )
@@ -501,7 +503,14 @@ class TriggerEditor(tk.Tk):
         monitor_frame.pack_propagate(False)
         monitor_frame.pack(side="top", fill="x", padx=8, pady=(0, 8))
 
-        ttk.Label(monitor_frame, text="Threshold (dB):").pack(side="left")
+        self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
+        self.monitor_button.pack(side="left")
+
+        ttk.Button(monitor_frame, text="Settings", width=BUTTON_WIDTH, command=self._toggle_timing_dialog).pack(
+            side="left", padx=(4, 4)
+        )
+
+        ttk.Label(monitor_frame, text="Threshold (dB):").pack(side="left", padx=(16, 0))
         self.threshold_var = tk.DoubleVar(value=0.0)
         threshold_spinbox = ttk.Spinbox(
             monitor_frame, from_=-80.0, to=0.0, increment=1.0, textvariable=self.threshold_var, width=6
@@ -509,13 +518,6 @@ class TriggerEditor(tk.Tk):
         threshold_spinbox.pack(side="left", padx=4)
         for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
             threshold_spinbox.bind(event, lambda e: self._on_monitor_settings_changed())
-
-        self.monitor_button = ttk.Button(monitor_frame, text="Start", width=BUTTON_WIDTH, command=self._toggle_monitoring)
-        self.monitor_button.pack(side="left", padx=(16, 4))
-
-        ttk.Button(monitor_frame, text="Settings", width=BUTTON_WIDTH, command=self._toggle_timing_dialog).pack(
-            side="left", padx=(4, 4)
-        )
 
         # Trigger counter + runtime: persisted via settings.json (self.trigger_count/
         # self.total_runtime_seconds are already initialized/loaded in __init__).
@@ -727,7 +729,10 @@ class TriggerEditor(tk.Tk):
             self.apply_threshold_button.config(state="disabled")
             return
         peak_db = compute_peak_db(segment, self.sample_rate)
-        suggested = math.floor(peak_db - THRESHOLD_SUGGESTION_MARGIN_DB)
+        headroom = self._safe_float(self.headroom_var)
+        if headroom is None:
+            headroom = HEADROOM_DEFAULT
+        suggested = math.floor(peak_db - headroom)
         self.selection_db_var.set(f"Peak {peak_db:.1f} dB, Threshold {suggested:.0f} dB")
         self.apply_threshold_button.config(state="normal")
 
@@ -739,13 +744,16 @@ class TriggerEditor(tk.Tk):
         if len(segment) == 0:
             return
         peak_db = compute_peak_db(segment, self.sample_rate)
+        headroom = self._safe_float(self.headroom_var)
+        if headroom is None:
+            headroom = HEADROOM_DEFAULT
         # Floored (not rounded to nearest) to a whole dB, so the result is always at least as
         # conservative as the raw suggestion (e.g. -55.8 -> -56.0, -24.2 -> -25.0) - never
         # rounds up into a less safe, more permissive value.
-        suggested = math.floor(peak_db - THRESHOLD_SUGGESTION_MARGIN_DB)
+        suggested = math.floor(peak_db - headroom)
         self.threshold_var.set(suggested)
         self._on_monitor_settings_changed()
-        self._log(f"Threshold set to {suggested:.0f} dB (peak {peak_db:.1f} dB - {THRESHOLD_SUGGESTION_MARGIN_DB:.0f} dB margin).")
+        self._log(f"Threshold set to {suggested:.0f} dB (peak {peak_db:.1f} dB - {headroom:.0f} dB headroom).")
 
     def _determine_range(self):
         if self.selection:
@@ -921,6 +929,8 @@ class TriggerEditor(tk.Tk):
             self.lure_splash_ignore_var.set(float(settings["lure_splash_ignore_seconds"]))
         if "cooldown_seconds" in settings:
             self.cooldown_var.set(float(settings["cooldown_seconds"]))
+        if "headroom_db" in settings:
+            self.headroom_var.set(float(settings["headroom_db"]))
 
         self.trigger_count = int(settings.get("trigger_count", 0))
         self.total_runtime_seconds = float(settings.get("total_runtime_seconds", 0.0))
@@ -998,6 +1008,7 @@ class TriggerEditor(tk.Tk):
             ("chest_normalize_px", self.chest_normalize_var),
             ("lure_splash_ignore_seconds", self.lure_splash_ignore_var),
             ("cooldown_seconds", self.cooldown_var),
+            ("headroom_db", self.headroom_var),
         ):
             value = self._safe_float(var)
             if value is not None:
@@ -1240,6 +1251,7 @@ class TriggerEditor(tk.Tk):
             ("Start Delay (s):", self.start_delay_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Lure Splash Ignore (s):", self.lure_splash_ignore_var, TIMING_DIALOG_SPINBOX_RANGE, None),
             ("Cooldown (s):", self.cooldown_var, TIMING_DIALOG_SPINBOX_RANGE, None),
+            ("Headroom (dB):", self.headroom_var, TIMING_DIALOG_SPINBOX_RANGE, None),
         )
         for row, (label, var, (from_, to, increment), range_var) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -1255,15 +1267,6 @@ class TriggerEditor(tk.Tk):
                 range_spinbox.grid(row=row, column=2, sticky="w", padx=(4, 0), pady=4)
                 for event in ("<FocusOut>", "<Return>", "<<Increment>>", "<<Decrement>>"):
                     range_spinbox.bind(event, lambda e: self._on_timing_settings_changed())
-
-        info_label = ttk.Label(frame, text="ⓘ", cursor="hand2")
-        info_label.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=4)
-        bind_tooltip(
-            info_label,
-            "The second field next to Fishing/Start/Lure Delay is a range: leave it at 0 "
-            "for a fixed delay (the first field), or enter a value to pick a random delay "
-            "between the two fields each time - which field is larger doesn't matter.",
-        )
 
     def _on_timing_settings_changed(self):
         self._save_settings()
