@@ -68,12 +68,12 @@ ROW_HEIGHT = 33
 WAVEFORM_HEIGHT = 100
 
 # ============================================================================
-# Fishing trigger timing - the actual values are user-adjustable via the "Timing" dialog
+# Fishing trigger timing - the actual values are user-adjustable via the "Settings" dialog
 # (see _toggle_timing_dialog) and persisted in settings.json; these are just the defaults for
 # a fresh settings.json (see __init__ for where the Tk variables are created).
-# Fishing/Lure/Utility Delay each have a companion "range" value (also in the Timing
-# dialog): 0 keeps the delay fixed at exactly the base value; a nonzero range instead picks
-# a random delay somewhere between the base value and the range value (see
+# Fishing/Lure/Utility/Attack/Chest Delay each have a companion "range" value (also in the
+# Settings dialog): 0 keeps the delay fixed at exactly the base value; a nonzero range
+# instead picks a random delay somewhere between the base value and the range value (see
 # _resolve_randomized_delay) - a simple way to make the timing less uniform/predictable
 # without giving up the option of a precise fixed delay. Start Delay is deliberately fixed,
 # no range - it's a one-off startup wait, not part of the humanized in-game timing.
@@ -140,7 +140,7 @@ CHEST_NORMALIZE_SPINBOX_RANGE = (0.0, 500.0, 1.0)
 class TriggerEditor(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Trigger Editor")
+        self.title("Cuecast")
         self.geometry(f"{MIN_WIDTH}x{MIN_HEIGHT}")
         self.minsize(MIN_WIDTH, MIN_HEIGHT)
 
@@ -470,7 +470,7 @@ class TriggerEditor(tk.Tk):
         # Simulates a single right-click at the saved position right now, regardless of the
         # interval/detection state - lets you confirm the captured position is correct
         # without waiting for a real bite or starting detection.
-        ttk.Button(trigger_frame, text="Test", width=BUTTON_WIDTH, command=self._test_chest_click).grid(
+        ttk.Button(trigger_frame, text="Test", width=BUTTON_WIDTH, command=self._send_chest_click).grid(
             row=4, column=2, sticky="w", padx=4, pady=2
         )
 
@@ -1390,34 +1390,24 @@ class TriggerEditor(tk.Tk):
             and time.perf_counter() - self.chest_last_used_at >= chest_interval
         )
 
-    def _run_fishing_trigger(
-        self, use_chest, chest_delay, use_lure, fishing_delay, lure_delay, use_utility, utility_delay
+    def _run_chest_lure_utility_sequence(
+        self, use_chest, chest_delay, use_lure, lure_delay, use_utility, utility_delay
     ):
-        # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
-        # sending + logging is brought back to the main thread via self.after (Tkinter is not
-        # thread-safe). Sequence: catch -> Fishing Delay -> (optional) chest click as its own
-        # in-between sequence with its own Chest Delay afterwards -> (optional) lure as its
-        # own in-between sequence with its own Lure Delay afterwards -> (optional) utility as
-        # its own in-between sequence with its own Utility Delay afterwards -> cast again.
-        # Chest, Lure and Utility never overlap - each is fully waited out (signal + its own
-        # delay) before the next step starts, even if more than one happens to be due in the
-        # same cycle. fishing_delay/lure_delay/utility_delay/chest_delay are resolved from
-        # the "Timing" dialog's Tk variables (base value, or a randomized value within a
-        # configured range - see _resolve_randomized_delay) on the main thread by the caller
-        # (_on_trigger_fired) and passed in here as plain values, since Tk variables must not
-        # be read from a background thread. self.monitor is checked after every sleep - Stop
-        # sets it to None, and this thread otherwise has no way of knowing Stop was pressed
-        # mid-sequence (it would just keep sending regardless).
-        self.after(0, self._send_fishing_signal)
-        time.sleep(fishing_delay)
-        if self.monitor is None:
-            return
+        # Runs (if enabled) Chest, then (if enabled) Lure, then (if enabled) Utility, each
+        # fully waited out (signal + its own delay) before the next starts - never
+        # overlapping. Shared by _run_fishing_trigger (the real-bite sequence: reel in -> ...
+        # -> cast again) and _run_startup_sequence (the Start warm-up: ... -> initial cast),
+        # which both need this exact same in-between sequence, just wrapped differently.
+        # self.monitor is checked after every sleep - Stop sets it to None, and the caller's
+        # thread otherwise has no way of knowing Stop was pressed mid-sequence (it would just
+        # keep sending regardless). Returns False if that happens, so the caller can abort
+        # immediately without sending anything further (e.g. no final cast).
         if use_chest:
-            # Chest comes right after the catch signal, before Lure/Utility.
+            # Chest comes right after the catch/Start, before Lure/Utility.
             self.after(0, self._send_chest_click)
             time.sleep(chest_delay)
             if self.monitor is None:
-                return
+                return False
         if use_lure:
             # The lure must happen before casting again (see _send_lure_signal, resets
             # lure_last_used_at, which _on_trigger_fired's lure-splash-ignore lockout relies
@@ -1426,13 +1416,37 @@ class TriggerEditor(tk.Tk):
             self.after(0, self._send_lure_signal)
             time.sleep(lure_delay)
             if self.monitor is None:
-                return
+                return False
         if use_utility:
             # Same idea as the lure: fully sequenced, not overlapping with anything else.
             self.after(0, self._send_utility_signal)
             time.sleep(utility_delay)
             if self.monitor is None:
-                return
+                return False
+        return True
+
+    def _run_fishing_trigger(
+        self, use_chest, chest_delay, use_lure, fishing_delay, lure_delay, use_utility, utility_delay
+    ):
+        # Runs in its own thread, so the wait times don't block the Tkinter UI. The actual
+        # sending + logging is brought back to the main thread via self.after (Tkinter is not
+        # thread-safe). Sequence: catch -> Fishing Delay -> (optional) chest/lure/utility as
+        # their own in-between sequence (see _run_chest_lure_utility_sequence) -> cast again.
+        # fishing_delay/lure_delay/utility_delay/chest_delay are resolved from the "Settings"
+        # dialog's Tk variables (base value, or a randomized value within a configured range
+        # - see _resolve_randomized_delay) on the main thread by the caller
+        # (_on_trigger_fired) and passed in here as plain values, since Tk variables must not
+        # be read from a background thread. self.monitor is checked after every sleep - Stop
+        # sets it to None, and this thread otherwise has no way of knowing Stop was pressed
+        # mid-sequence (it would just keep sending regardless).
+        self.after(0, self._send_fishing_signal)
+        time.sleep(fishing_delay)
+        if self.monitor is None:
+            return
+        if not self._run_chest_lure_utility_sequence(
+            use_chest, chest_delay, use_lure, lure_delay, use_utility, utility_delay
+        ):
+            return
         self.after(0, self._send_fishing_signal)
         # A new cast begins now - the timeout clock (see _check_fishing_trigger_timeout)
         # restarts from here.
@@ -1441,35 +1455,22 @@ class TriggerEditor(tk.Tk):
     def _run_startup_sequence(
         self, start_delay, chest_enabled, chest_delay, lure_enabled, lure_delay, utility_enabled, utility_delay
     ):
-        # Runs once right after Start: (if enabled) Chest, then (if enabled) Lure, then (if
-        # enabled) Utility, fully in sequence (signal + its own delay each) - never
-        # overlapping - and only THEN the first actual cast. Otherwise an enabled
-        # Chest/Lure/Utility would sit unused until its interval AND a real bite happen to
-        # coincide, which with a long interval (e.g. 30+ minutes) could take a very long
-        # time. Mirrors the real-bite sequence in _run_fishing_trigger (reel in -> Chest ->
-        # Lure -> Utility -> cast again), just without a "reel in" step since nothing was
-        # cast yet. Waits out the Start Delay first.
+        # Runs once right after Start: the same Chest/Lure/Utility in-between sequence as a
+        # real bite (see _run_chest_lure_utility_sequence), and only THEN the first actual
+        # cast. Otherwise an enabled Chest/Lure/Utility would sit unused until its interval
+        # AND a real bite happen to coincide, which with a long interval (e.g. 30+ minutes)
+        # could take a very long time. Mirrors _run_fishing_trigger, just without a "reel in"
+        # step since nothing was cast yet. Waits out the Start Delay first.
         # self.monitor is checked after every sleep - Stop sets it to None, and this thread
         # otherwise has no way of knowing Stop was pressed mid-sequence (it would just keep
         # sending regardless, e.g. right after a Start immediately followed by a Stop).
         time.sleep(start_delay)
         if self.monitor is None:
             return
-        if chest_enabled:
-            self.after(0, self._send_chest_click)
-            time.sleep(chest_delay)
-            if self.monitor is None:
-                return
-        if lure_enabled:
-            self.after(0, self._send_lure_signal)
-            time.sleep(lure_delay)
-            if self.monitor is None:
-                return
-        if utility_enabled:
-            self.after(0, self._send_utility_signal)
-            time.sleep(utility_delay)
-            if self.monitor is None:
-                return
+        if not self._run_chest_lure_utility_sequence(
+            chest_enabled, chest_delay, lure_enabled, lure_delay, utility_enabled, utility_delay
+        ):
+            return
         self.after(0, self._send_fishing_signal)
         # Real timeout counting starts only now, from this first actual cast (not before,
         # while Lure/Utility/Chest were still in progress) - so the next "No bite" (see
@@ -1560,9 +1561,6 @@ class TriggerEditor(tk.Tk):
         self.chest_y_var.set(y)
         self._save_settings()
         self._log(f"Chest position captured: ({x}, {y}).")
-
-    def _test_chest_click(self):
-        self._send_chest_click()
 
     def _send_signal(self, mod_ctrl_var, mod_alt_var, mod_shift_var, key_var, trigger_name):
         key = key_var.get()

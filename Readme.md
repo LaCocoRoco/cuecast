@@ -2,8 +2,6 @@
 
 Vibe-coded with Claude. I didn't hand-write a line of it, and I don't care. Use at your own risk.
 
-#### Gold earned since last update: 500000
-
 Audio-threshold-based trigger tool: listens to loopback audio, and reacts to loud events by
 sending configured key combinations.
 
